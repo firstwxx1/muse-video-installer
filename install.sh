@@ -58,7 +58,7 @@ if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
   fi
 fi
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 # 前缀统一用 mvw-（Muse Video Workbench），避免和用户已有的 muse-video / muse2api
 # 等同名服务撞车 —— 曾因默认名与既有服务的 unit 重名，把别人的服务覆盖掉。
 APP_NAME="mvw"
@@ -1958,7 +1958,7 @@ write_webpage() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Muse 视频工作台</title>
+<title>Muse 工作台</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -2069,6 +2069,14 @@ write_webpage() {
   .hist-badge.ok { color:var(--ok); border-color:#b8e0c8; background:#f0f9f4; }
   .hist-badge.fail { color:var(--err); border-color:#f0c8c4; background:var(--accent-soft); }
   .hist-badge.run { color:var(--warn); border-color:#eed9ac; background:#fdf8ec; }
+  .tabs { display:flex; gap:5px; background:var(--panel-2); border:1px solid var(--border);
+    border-radius:var(--radius); padding:4px; margin-bottom:18px; }
+  .tab { flex:1; text-align:center; font-size:12px; color:var(--text-2); padding:7px 6px;
+    border-radius:7px; cursor:pointer; transition:all .15s; user-select:none; }
+  .tab:hover { color:var(--text); }
+  .tab.sel { background:var(--panel); color:var(--accent); font-weight:500;
+    box-shadow:0 1px 2px rgba(35,35,31,.06); }
+  .preview-img { width:100%; border-radius:var(--radius); display:block; background:var(--panel-2); }
   .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(80px);
     background:var(--text); color:#fff; font-size:13px; padding:11px 20px; border-radius:var(--radius);
     opacity:0; transition:all .25s; pointer-events:none; z-index:99; max-width:90vw; }
@@ -2080,7 +2088,7 @@ write_webpage() {
   <header>
     <div class="brand">
       <div class="logo">M</div>
-      <div><h1>Muse 视频工作台</h1><p>文生视频 · 首帧图生视频</p></div>
+      <div><h1>Muse 工作台</h1><p>文生视频 · 首帧图生视频 · 文生图 · 图像编辑</p></div>
     </div>
     <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">未连接</span></div>
   </header>
@@ -2088,12 +2096,16 @@ write_webpage() {
   <div class="grid">
     <div>
       <div class="card">
-        <div class="card-title">创作</div>
+        <div class="card-title"><span>创作</span><span class="hint" id="modeHint">视频</span></div>
+        <div class="tabs" id="tabs">
+          <div class="tab sel" data-kind="video">生成视频</div>
+          <div class="tab" data-kind="image">生成图片</div>
+        </div>
         <label class="field">
-          <div class="lbl"><span>视频描述</span><span class="count" id="promptCount">0 / 1000</span></div>
+          <div class="lbl"><span id="promptLbl">视频描述</span><span class="count" id="promptCount">0 / 1000</span></div>
           <textarea id="prompt" maxlength="1000" placeholder="描述你想要的画面，越具体越好。例如：&#10;金色的枫叶在微风中缓缓飘落，阳光穿过树梢，镜头缓慢推进，电影级景深"></textarea>
         </label>
-        <label class="field">
+        <label class="field" id="durField">
           <div class="lbl"><span>时长</span></div>
           <select id="duration">
             <option value="5" selected>5 秒</option>
@@ -2111,7 +2123,7 @@ write_webpage() {
           </div>
         </label>
         <label class="field">
-          <div class="lbl"><span>首帧图（可选）</span><span class="count">不填＝文生视频</span></div>
+          <div class="lbl"><span id="refLbl">首帧图（可选）</span><span class="count" id="refHint">不填＝文生视频</span></div>
           <div class="drop" id="drop">
             <input type="file" id="file" accept="image/*" hidden>
             <div id="dropInner">
@@ -2163,9 +2175,27 @@ write_webpage() {
   'use strict';
   var LS_CFG = 'muse_video_cfg', LS_HIST = 'muse_video_hist', POLL_MS = 4000;
   var $ = function (id) { return document.getElementById(id); };
-  var state = { base:'', key:'', size:'16:9', firstFrame:null, busy:false,
+  var state = { base:'', key:'', size:'16:9', firstFrame:null, busy:false, kind:'video',
                 timer:null, taskId:null, tasks:[] };
   var curDur = 5;
+
+  // 两种创作模式：同一个描述框，只换目标接口和文案。
+  // 视频走 /v1/videos（同步排队），图片走 /v1/images/generations + async 轮询
+  // —— 生图也可能跑一两分钟，同步接口会被反代掐断，所以统一走任务轮询。
+  var MODES = {
+    video: { label:'视频', promptLbl:'视频描述', btn:'生成视频',
+             empty:'在左侧填写描述，点击「生成视频」开始创作',
+             refLbl:'首帧图（可选）', refHint:'不填＝文生视频',
+             refT2:'作为视频首帧 · 支持 JPG / PNG / WebP',
+             wait:'视频生成通常需要 1～2 分钟，请保持页面打开',
+             ph:'描述你想要的画面，越具体越好。例如：\n金色的枫叶在微风中缓缓飘落，阳光穿过树梢，镜头缓慢推进，电影级景深' },
+    image: { label:'图片', promptLbl:'图片描述', btn:'生成图片',
+             empty:'在左侧填写描述，点击「生成图片」开始创作',
+             refLbl:'参考图（可选）', refHint:'不填＝文生图',
+             refT2:'作为参考图 · 不填＝文生图，填了＝图生图 / 图像编辑',
+             wait:'图片生成通常需要 30～60 秒，请保持页面打开',
+             ph:'描述你想要的画面，越具体越好。例如：\n一只戴圆框眼镜的橘猫坐在窗边的旧书堆上，午后斜阳，颗粒感胶片质感，浅景深' }
+  };
 
   function toast(m){ var t=$('toast'); t.textContent=m; t.classList.add('show');
     clearTimeout(t._h); t._h=setTimeout(function(){t.classList.remove('show');},2600); }
@@ -2191,17 +2221,45 @@ write_webpage() {
     state.base=normBase(qa||c.base||location.origin.replace(/:\d+$/, ':18610'));
     state.key=(qk||c.key||'').trim();
     $('baseUrl').value=state.base; $('apiKey').value=state.key;
+    if(MODES[c.kind]) state.kind=c.kind;
     if(linked){
-      try{ localStorage.setItem(LS_CFG, JSON.stringify({base:state.base,key:state.key})); }catch(e){}
+      try{ localStorage.setItem(LS_CFG, JSON.stringify({base:state.base,key:state.key,kind:state.kind})); }catch(e){}
       try{ history.replaceState(null,'',location.pathname); }catch(e){}
       toast('已自动填好接口地址和 API Key');
     }
+    applyMode(state.kind, true);
     if(state.key) testConn(true);
   }
   function saveCfg(){
     state.base=normBase($('baseUrl').value); state.key=$('apiKey').value.trim();
     $('baseUrl').value=state.base;
-    localStorage.setItem(LS_CFG, JSON.stringify({base:state.base,key:state.key}));
+    localStorage.setItem(LS_CFG, JSON.stringify({base:state.base,key:state.key,kind:state.kind}));
+  }
+  function emptyTaskHtml(){
+    return '<div class="task-empty"><div class="ico">'+(state.kind==='image'?'▤':'▷')+
+      '</div><div class="t">'+MODES[state.kind].empty+'</div></div>';
+  }
+  function applyMode(kind, silent){
+    state.kind = MODES[kind] ? kind : 'video';
+    var m = MODES[state.kind];
+    [].forEach.call(document.querySelectorAll('#tabs .tab'), function(el){
+      el.classList.toggle('sel', el.dataset.kind === state.kind);
+    });
+    $('modeHint').textContent = m.label;
+    $('promptLbl').textContent = m.promptLbl;
+    $('prompt').placeholder = m.ph;
+    $('genBtnText').textContent = state.busy ? '生成中…' : m.btn;
+    $('durField').style.display = state.kind === 'video' ? '' : 'none';
+    $('refLbl').textContent = m.refLbl;
+    $('refHint').textContent = m.refHint;
+    if(!state.firstFrame) dropPlaceholder();
+    // 只在「当前面板还没任务」时换掉右侧空态文案，别打断正在跑的任务
+    if(!state.tasks.length && !state.busy) $('taskArea').innerHTML = emptyTaskHtml();
+    if(!silent) saveCfg();
+  }
+  function dropPlaceholder(){
+    $('dropInner').innerHTML = '<div class="ico">＋</div><div class="t1">点击或拖拽图片到这里</div>'+
+      '<div class="t2">'+MODES[state.kind].refT2+'</div>';
   }
   function testConn(silent){
     if(!state.base||!state.key){ setStatus('off','未配置'); return; }
@@ -2215,8 +2273,8 @@ write_webpage() {
 
   function loadHist(){ try{ state.tasks=JSON.parse(localStorage.getItem(LS_HIST)||'[]'); }catch(e){ state.tasks=[]; } renderHist(); }
   function saveHist(){
-    var slim=state.tasks.slice(0,30).map(function(t){ return {id:t.id,prompt:t.prompt,status:t.status,
-      size:t.size,duration:t.duration,created:t.created,url:t.url||'',bytes:t.bytes||0,err:t.err||''}; });
+    var slim=state.tasks.slice(0,30).map(function(t){ return {id:t.id,kind:t.kind||'video',prompt:t.prompt,
+      status:t.status,size:t.size,duration:t.duration||0,created:t.created,url:t.url||'',bytes:t.bytes||0,err:t.err||''}; });
     try{ localStorage.setItem(LS_HIST,JSON.stringify(slim)); }catch(e){}
   }
   function addTask(t){ state.tasks.unshift(t); if(state.tasks.length>30) state.tasks.length=30; renderHist(); saveHist(); }
@@ -2232,9 +2290,11 @@ write_webpage() {
       if(t.status==='completed'){ b='已完成'; c='ok'; }
       else if(t.status==='failed'){ b='失败'; c='fail'; }
       else { b='生成中'; c='run'; }
-      h+='<div class="hist-item" data-i="'+i+'"><div class="hist-thumb">'+(t.url?'▷':'…')+'</div>'+
+      var isImg = t.kind === 'image';
+      h+='<div class="hist-item" data-i="'+i+'"><div class="hist-thumb">'+(t.url?(isImg?'▣':'▷'):'…')+'</div>'+
         '<div class="hist-body"><div class="hist-prompt">'+esc(t.prompt||'(无描述)')+'</div>'+
-        '<div class="hist-sub">'+esc(t.size||'')+' · '+(t.duration||5)+'s · '+fmtTime(t.created)+
+        '<div class="hist-sub">'+MODES[t.kind||'video'].label+' · '+esc(t.size||'')+
+        (isImg?'':' · '+(t.duration||5)+'s')+' · '+fmtTime(t.created)+
         (t.bytes?' · '+fmtBytes(t.bytes):'')+'</div></div>'+
         '<span class="hist-badge '+c+'">'+b+'</span></div>';
     });
@@ -2246,12 +2306,17 @@ write_webpage() {
 
   function showTask(t){
     var area=$('taskArea'); $('taskHint').textContent=t.id||'';
+    var isImg = (t.kind === 'image');
     if(t.status==='completed'&&t.url){
       var abs=/^https?:\/\//i.test(t.url)?t.url:state.base+t.url;
-      area.innerHTML='<video src="'+abs+'" controls playsinline preload="metadata"></video>'+
-        '<div class="result-meta"><div class="meta-txt">'+esc(t.size||'')+' · '+(t.duration||5)+'s'+
+      var media = isImg ? '<img class="preview-img" src="'+abs+'" alt="">'
+                        : '<video src="'+abs+'" controls playsinline preload="metadata"></video>';
+      area.innerHTML=media+
+        '<div class="result-meta"><div class="meta-txt">'+esc(t.size||'')+
+        (isImg?'':' · '+(t.duration||5)+'s')+
         (t.bytes?' · '+fmtBytes(t.bytes):'')+'</div><div class="result-actions">'+
-        '<a href="'+abs+'" download target="_blank" rel="noopener"><button class="btn btn-ghost">下载视频</button></a>'+
+        '<a href="'+abs+'" download target="_blank" rel="noopener"><button class="btn btn-ghost">'+
+        (isImg?'下载图片':'下载视频')+'</button></a>'+
         '<a href="'+abs+'" target="_blank" rel="noopener"><button class="btn btn-ghost">新窗口打开</button></a>'+
         '</div></div><div class="prog-note" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">'+
         esc(t.prompt||'')+'</div>';
@@ -2267,40 +2332,51 @@ write_webpage() {
     area.innerHTML='<div class="prog-head"><span class="prog-status">'+(pct>=100?'正在保存':'生成中')+
       '</span><span class="prog-pct">'+pct+'%</span></div>'+
       '<div class="bar"><i style="width:'+Math.max(pct,4)+'%"></i></div>'+
-      '<div class="prog-note">视频生成通常需要 1～2 分钟，请保持页面打开</div>'+
+      '<div class="prog-note">'+MODES[t.kind||'video'].wait+'</div>'+
       '<div class="prog-note" style="margin-top:12px">'+esc(t.prompt||'')+'</div>';
   }
 
   function stopPolling(){ if(state.timer){ clearInterval(state.timer); state.timer=null; } }
   function startPolling(id){ stopPolling(); state.timer=setInterval(function(){ poll(id); }, POLL_MS); }
 
-  function currentPrompt(id){ for(var i=0;i<state.tasks.length;i++){ if(state.tasks[i].id===id) return state.tasks[i].prompt; } return ''; }
+  function taskOf(id){ for(var i=0;i<state.tasks.length;i++){ if(state.tasks[i].id===id) return state.tasks[i]; } return null; }
+  // 轮询回填时把任务原有字段一起带上，否则 showTask 拿不到 prompt / kind / 画幅
+  function taskView(id){
+    var t=taskOf(id)||{};
+    return {id:id, kind:t.kind||'video', prompt:t.prompt||'', size:t.size||state.size, duration:t.duration||0};
+  }
 
   function poll(id){
-    fetch(api('/v1/videos/'+id),{headers:headers()}).then(function(r){ return r.json(); }).then(function(j){
+    var kind=(taskOf(id)||{}).kind||'video';
+    // 视频：GET /v1/videos/{id}；图片：GET /v1/images/tasks/{id}（异步生图的结果在 data[0]）
+    var path = kind==='image' ? '/v1/images/tasks/'+id : '/v1/videos/'+id;
+    fetch(api(path),{headers:headers()}).then(function(r){ return r.json(); }).then(function(j){
       var status=j.status, pct=(typeof j.progress==='number')?j.progress:0;
       var patch={status:status,progress:pct};
       if(status==='completed'||status==='succeeded'){
-        var res=j.result||{};
-        patch.status='completed'; patch.url=res.url||''; patch.bytes=res.bytes||0;
+        var res=j.result||{}, d=(j.data&&j.data[0])||{};
+        patch.status='completed';
+        patch.url=j.url||res.url||d.url||'';
+        patch.bytes=j.bytes||res.bytes||d.bytes||0;
         stopPolling(); setBusy(false); updTask(id,patch);
-        showTask(Object.assign({id:id},patch,{prompt:currentPrompt(id),size:state.size,duration:curDur}));
-        toast('视频生成完成'); return;
+        showTask(Object.assign(taskView(id),patch));
+        toast(MODES[kind].label+'生成完成'); return;
       }
       if(status==='failed'||status==='error'){
-        patch.status='failed'; patch.err=j.error||'生成失败';
+        var em=j.error; if(em&&typeof em==='object') em=em.message||JSON.stringify(em);
+        patch.status='failed'; patch.err=em||'生成失败';
         stopPolling(); setBusy(false); updTask(id,patch);
-        showTask(Object.assign({id:id},patch,{prompt:currentPrompt(id),size:state.size,duration:curDur}));
+        showTask(Object.assign(taskView(id),patch));
         return;
       }
       updTask(id,patch);
-      showTask(Object.assign({id:id,progress:pct,status:status},{prompt:currentPrompt(id),size:state.size,duration:curDur}));
+      showTask(Object.assign(taskView(id),{status:status,progress:pct}));
     }).catch(function(){});
   }
 
   function setBusy(b){
     state.busy=b; var btn=$('genBtn'); btn.disabled=b;
-    $('genBtnText').textContent=b?'生成中…':'生成视频';
+    $('genBtnText').textContent=b?'生成中…':MODES[state.kind].btn;
     if(b&&!btn.querySelector('.spinner')){
       var sp=document.createElement('span'); sp.className='spinner'; btn.insertBefore(sp,$('genBtnText'));
     } else if(!b){ var ex=btn.querySelector('.spinner'); if(ex) ex.remove(); }
@@ -2309,12 +2385,23 @@ write_webpage() {
   function generate(){
     if(state.busy) return;
     if(!state.base||!state.key){ toast('请先在下方填写接口地址与 API Key'); return; }
+    var kind=state.kind, m=MODES[kind];
     var prompt=$('prompt').value.trim();
-    if(!prompt){ toast('请填写视频描述'); return; }
-    var payload={prompt:prompt,duration:parseInt($('duration').value,10)||5,size:state.size};
-    if(state.firstFrame) payload.image=state.firstFrame;
-    curDur=payload.duration; setBusy(true);
-    fetch(api('/v1/videos'),{method:'POST',headers:headers(),body:JSON.stringify(payload)})
+    if(!prompt){ toast('请填写'+m.promptLbl); return; }
+    var payload, path;
+    if(kind==='image'){
+      // async=true：立刻拿任务号再轮询。同步生图要跑几十秒，
+      // 走反代时那条长连接会被掐断（muse2api 也是这么建议的）。
+      payload={model:'muse-image',prompt:prompt,size:state.size,async:true};
+      if(state.firstFrame) payload.image=state.firstFrame;   // 有参考图 → 图生图 / 图像编辑
+      path='/v1/images/generations';
+    } else {
+      payload={prompt:prompt,duration:parseInt($('duration').value,10)||5,size:state.size};
+      if(state.firstFrame) payload.image=state.firstFrame;   // 有首帧图 → 图生视频
+      path='/v1/videos';
+    }
+    curDur=payload.duration||0; setBusy(true);
+    fetch(api(path),{method:'POST',headers:headers(),body:JSON.stringify(payload)})
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,status:r.status,body:j}; }); })
       .then(function(res){
         if(!res.ok){
@@ -2324,9 +2411,9 @@ write_webpage() {
         var id=res.body.id||res.body.task_id;
         if(!id) throw new Error('服务端未返回任务 ID');
         state.taskId=id;
-        addTask({id:id,prompt:prompt,status:'queued',progress:10,size:state.size,
-          duration:payload.duration,created:Math.floor(Date.now()/1000),url:'',bytes:0,err:''});
-        showTask({id:id,prompt:prompt,status:'queued',progress:10,size:state.size,duration:payload.duration});
+        addTask({id:id,kind:kind,prompt:prompt,status:'queued',progress:5,size:state.size,
+          duration:payload.duration||0,created:Math.floor(Date.now()/1000),url:'',bytes:0,err:''});
+        showTask({id:id,kind:kind,prompt:prompt,status:'queued',progress:5,size:state.size,duration:payload.duration||0});
         toast('任务已提交，正在生成…'); startPolling(id);
       })
       .catch(function(e){ setBusy(false); toast('提交失败：'+e.message); });
@@ -2350,9 +2437,7 @@ write_webpage() {
         $('dropInner').innerHTML='<img src="'+fr.result+'"><button class="clear-img" type="button">×</button>';
         drop.querySelector('.clear-img').onclick=function(e){
           e.stopPropagation(); state.firstFrame=null; drop.classList.remove('has-img');
-          $('dropInner').innerHTML='<div class="ico">＋</div><div class="t1">点击或拖拽图片到这里</div>'+
-            '<div class="t2">作为视频首帧 · 支持 JPG / PNG / WebP</div>';
-          file.value='';
+          dropPlaceholder(); file.value='';
         };
       };
       fr.readAsDataURL(f);
@@ -2361,6 +2446,11 @@ write_webpage() {
 
   function bind(){
     $('prompt').oninput=function(){ $('promptCount').textContent=$('prompt').value.length+' / 1000'; };
+    $('tabs').onclick=function(e){
+      var el=e.target.closest?e.target.closest('.tab'):null;
+      if(!el||state.busy) return;                 // 生成中不让切模式，免得结果对不上
+      applyMode(el.dataset.kind, false);
+    };
     $('sizes').onclick=function(e){
       var el=e.target.closest?e.target.closest('.size-opt'):null; if(!el) return;
       this.querySelectorAll('.size-opt').forEach(function(o){ o.classList.remove('sel'); });
