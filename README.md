@@ -1,10 +1,10 @@
 # Muse 视频工作台 · 一键安装（firstwxx1 版）
 
-![Version](https://img.shields.io/badge/版本-v1.5.0-blue)
+![Version](https://img.shields.io/badge/版本-v1.6.0-blue)
 ![Fork](https://img.shields.io/badge/基于-yys9253462--gif%2Fmuse--video--installer-green)
 
-> 在**你自己的服务器**上，一条命令装好一个「输入文字就能生成视频」的网页工具。
-> 装完后：浏览器打开网址 → 写一句话 → 出视频。还能让别的软件（Cherry Studio、NextChat 等）连上它调用接口。
+> 在**你自己的服务器**上，一条命令装好一个「输入文字就能生成视频 / 图片」的网页工具。
+> 装完后：浏览器打开网址 → 写一句话 → 出视频或出图。还能让别的软件（Cherry Studio、NextChat 等）连上它调用接口。
 
 **不需要懂 Linux，不需要懂 Docker。** 脚本会自己把该装的都装好。
 
@@ -26,6 +26,19 @@
 ## 这个版本改了什么
 
 本仓库 fork 自 [yys9253462-gif/muse-video-installer](https://github.com/yys9253462-gif/muse-video-installer)（原版 v1.1.1），迭代记录：
+
+**v1.6.0 · 网页里能生成图片了（文生图 / 图生图）**
+
+之前网页只有视频 —— 其实后端一直是有生图能力的（`/v1/images/*`、模型 `muse-image`），
+只是网页上没做入口。这版把入口补上：
+
+| 变化 | 说明 |
+|---|---|
+| **创作区两个页签** | 「生成视频 / 生成图片」一键切换，同一个描述框，画幅、参考图共用 |
+| **文生图** | 直接写一句话出图，走 `POST /v1/images/generations`，默认 `async` + 轮询（生图也要几十秒，同步长连接会被反代掐断） |
+| **图生图 / 图像编辑** | 拖一张参考图进「参考图」框再生成 —— 后端会自动走 reference image 流程（去水印、按描述重绘），对应 `muse-image` 的编辑能力 |
+| **历史记录区分类型** | 图片和视频记录分开标记，点开该出图出图、该出片出片；下载按钮文案也跟着变 |
+| **切模式记在本地** | 上次用图片模式，下次打开还是图片模式 |
 
 **v1.5.0 · 终端控制面板 + 装完即用 + 多账号**
 
@@ -325,7 +338,16 @@ sudo bash /opt/mvw/install.sh --add-account
 
 ### 第 3 步：生成
 
-回到网页，写一句描述，点生成。1-2 分钟出片。
+回到网页，创作区上面有两个页签：
+
+**生成视频（默认）** —— 写一句描述，点「生成视频」，1-2 分钟出片（可以选 5 / 6 / 10 秒、四种画幅）。
+拖一张图进「首帧图」框就是**图生视频**。
+
+**生成图片** —— 切到「生成图片」，写一句描述，点「生成图片」，30-60 秒出图。
+拖一张参考图进「参考图」框就是**图生图 / 图像编辑**（后端会把参考图交给模型按你的描述重绘）。
+画幅和视频共用（16:9 / 9:16 / 1:1 / 4:3）。
+
+历史记录里图片和视频都有，点一下就能看 / 下载。
 
 ### 管账号池
 
@@ -343,6 +365,32 @@ Cherry Studio / NextChat 等支持 OpenAI 风格接口的软件都能连：
 
 - 接口地址：`http://你的服务器IP:接口端口/v1`（域名有配反代的话也可以用 `https://你的域名`）
 - API Key：安装结束时给你的那把（`--status` 随时能看回来）
+- 可用的模型名：`muse-spark`（对话/代码）、`muse-image`（生图）、`muse-video`（生视频）
+
+**生图接口长这样**（`KEY` 换成你的 Key）：
+
+```bash
+# 文生图（同步，简单粗暴，慢但省事）
+curl -s http://127.0.0.1:18610/v1/images/generations \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"muse-image","prompt":"一只戴圆框眼镜的橘猫坐在旧书堆上，午后斜阳","size":"1:1"}'
+
+# 图生图 / 图像编辑（async，先拿任务号再轮询；image 支持 URL / data: URI / base64）
+curl -s http://127.0.0.1:18610/v1/images/generations \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"muse-image","prompt":"把背景换成雪山","async":true,"image":"https://example.com/a.png"}'
+# → {"id":"…","status":"queued"}   然后：
+curl -s http://127.0.0.1:18610/v1/images/tasks/<上面返回的 id> \
+  -H "Authorization: Bearer $KEY"
+# → status 变 completed 时，data[0].url 就是图片地址（也在 task 的 url 字段里）
+
+# OpenAI 风格的图像编辑（multipart，二进制直传）
+curl -s http://127.0.0.1:18610/v1/images/edits \
+  -H "Authorization: Bearer $KEY" \
+  -F model=muse-image -F prompt="换成夜晚霓虹" -F image=@local.png
+```
+
+生成的图片和视频都存在 `/opt/mvw/data/media/`，通过 `/v1/media/<文件名>` 访问。
 
 ---
 
@@ -387,7 +435,7 @@ Cherry Studio / NextChat 等支持 OpenAI 风格接口的软件都能连：
 - 程序本体：[yys9253462-gif/muse2api](https://github.com/yys9253462-gif/muse2api)
   —— 基于上游 [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api)（MIT 协议），
   叠加了 11 项稳定性与安全修复
-- 安装脚本版本：`1.5.0`
+- 安装脚本版本：`1.6.0`
 
 ### v1.3.0 一键导号的实现要点
 
