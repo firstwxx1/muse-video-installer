@@ -58,7 +58,7 @@ if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
   fi
 fi
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 # 前缀统一用 mvw-（Muse Video Workbench），避免和用户已有的 muse-video / muse2api
 # 等同名服务撞车 —— 曾因默认名与既有服务的 unit 重名，把别人的服务覆盖掉。
 APP_NAME="mvw"
@@ -2647,6 +2647,24 @@ do_install() {
 }
 
 # ── 域名：复用/自建 Caddy ────────────────────────────────────────────
+# v1.4.2：站点块把 /v1/* 也反代到接口端口 —— 网页走域名时，页面里的
+# 「接口地址」可以直接填同源 https://域名，没有跨域、没有混合内容。
+# （实测坑：域名页 localStorage 是空的，自动推导出的接口地址是域名本身，
+#   之前没这条反代时 /v1/models 全 404，状态灯永远「未连接」。）
+caddy_site_block() {
+  cat <<EOF
+$DOMAIN {
+	encode zstd gzip
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:${API_PORT}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:${WEB_PORT}
+	}
+}
+EOF
+}
+
 setup_domain_caddy() {
   local block_file
   # 情况 A：宿主上有 caddy 二进制
@@ -2656,15 +2674,11 @@ setup_domain_caddy() {
     run cp "$cfg" "$bak"
     strip_managed_block "$cfg"
     if [ "$DRY_RUN" != 1 ]; then
-      cat >> "$cfg" <<EOF
-
-# >>> muse-video managed block —— 由 install-muse-video.sh 维护，请勿手改 >>>
-$DOMAIN {
-	encode zstd gzip
-	reverse_proxy 127.0.0.1:${WEB_PORT}
-}
-# <<< muse-video managed block <<<
-EOF
+      {
+        printf '\n# >>> muse-video managed block —— 由 install-muse-video.sh 维护，请勿手改 >>>\n'
+        caddy_site_block
+        printf '# <<< muse-video managed block <<<\n'
+      } >> "$cfg"
     fi
     if run caddy validate --config "$cfg" >/dev/null 2>&1; then
       if run systemctl reload caddy 2>/dev/null || run caddy reload --config "$cfg" 2>/dev/null; then
@@ -2673,6 +2687,26 @@ EOF
       fi
     fi
     run cp "$bak" "$cfg"
+    return 1
+  fi
+
+  # 情况 B'：80/443 被占 —— 但占用者是我们自己上次起的 caddy 容器。
+  #    早期版本不认识自家 caddy，一律报「被别的程序占着」然后放弃，
+  #    导致重跑安装永远更新不了 Caddyfile（比如 v1.4.2 要补 /v1/ 反代）。
+  if [ "$(docker inspect -f '{{.State.Status}}' "$CADDY_NAME" 2>/dev/null)" = "running" ] \
+     && [ -f "$INSTALL_DIR/Caddyfile" ]; then
+    if [ "$DRY_RUN" != 1 ]; then
+      {
+        printf '{\n\temail admin@%s\n}\n\n' "$DOMAIN"
+        caddy_site_block
+      } > "$INSTALL_DIR/Caddyfile"
+    fi
+    if run docker exec "$CADDY_NAME" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+      ok "域名仍由上次装的 caddy 服务，配置已热更新"
+      return 0
+    fi
+    warn "caddy 热重载失败，改重启容器"
+    run docker restart "$CADDY_NAME" >/dev/null 2>&1 && { ok "caddy 已重启，域名配置已更新"; return 0; }
     return 1
   fi
 
@@ -2687,16 +2721,10 @@ EOF
   run docker volume create muse_caddy_data >/dev/null 2>&1 || true
   if [ "$DRY_RUN" != 1 ]; then
     # 必须先落盘再 up，否则 docker 会把不存在的文件创建成目录
-    cat > "$INSTALL_DIR/Caddyfile" <<EOF
-{
-	email admin@${DOMAIN}
-}
-
-$DOMAIN {
-	encode zstd gzip
-	reverse_proxy 127.0.0.1:${WEB_PORT}
-}
-EOF
+    {
+      printf '{\n\temail admin@%s\n}\n\n' "$DOMAIN"
+      caddy_site_block
+    } > "$INSTALL_DIR/Caddyfile"
   fi
   run docker run -d --name "$CADDY_NAME" --restart always \
     --network host \
