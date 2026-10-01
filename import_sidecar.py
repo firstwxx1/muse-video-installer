@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Muse 视频工作台 · 网页一键导号 sidecar（v1.3.0）
+"""Muse 视频工作台 · 网页一键导号 sidecar（v1.4.0）
 
 干什么用：
     原版导号要在用户自己的电脑上装 Python、跑脚本、手填服务器地址和 Key。
@@ -9,9 +9,16 @@
     鼠标键盘操作转发回去。用户在里面登录 muse.ai，session cookie 一出现就
     自动抓下来、自动注册进 muse2api 账号池。用户全程只需要一个浏览器。
 
+两条进入路径（v1.4.0）：
+    · ?key=<MUSE2API_KEY>    手动粘贴 Key（老方式，长期有效）
+    · ?token=<一次性令牌>     install.sh --add-account 在终端生成，15 分钟有效、
+                             导入成功即作废；页面拿到 token 会跳过填 Key 直接开窗，
+                             终端同时轮询 /api/token_status 显示导入结果
+
 安全模型：
     · 网页本身不含任何密钥（连 HTML 都是公开无害的）
-    · WebSocket 连接必须带 ?key=<MUSE2API_KEY>，与 compose 注入的环境变量比对
+    · WebSocket 连接必须带有效 key 或未使用且未过期的 token
+    · 令牌文件在宿主机 ./runtime 卷上，两边都「读-改-原子替换」
     · cookie 只经本机回环进账号池，不落地、不外发
 
 依赖：复用 muse2api 镜像（chromium + python + fastapi/uvicorn 都在），
@@ -48,6 +55,7 @@ API_BASE = os.environ.get(
     f"http://172.17.0.1:{os.environ.get('MUSE2API_PORT', '18610')}",
 )
 IMPORT_PORT = int(os.environ.get("IMPORT_PORT", "18620"))
+TOKENS_FILE = os.environ.get("TOKENS_FILE", "/runtime/import_tokens.json")
 CHROMIUM = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
 CDP_PORT = 19999  # 容器内回环端口，不发布
 LOGIN_URL = "https://muse.ai/login"
@@ -329,6 +337,60 @@ def import_account(label: str, cookies: dict[str, dict]) -> dict:
     })
 
 
+# ── 一次性导号令牌（install.sh --add-account 在宿主机生成）────────────
+#    文件经 ./runtime 卷共享。宿主机只「加新令牌+清理过期」，本进程只
+#    「回写 used 标记」——两边都是读-改-原子替换，竞争窗口的最坏结果
+#    只是丢一次 used 标记（令牌多活几分钟），不会丢令牌本身。
+_active_tokens: set[str] = set()      # 正被某条 ws 占用的令牌
+_token_results: dict[str, str] = {}   # 本进程内已完成：令牌 → 邮箱（重启后靠文件里的记录兜底）
+
+
+def _load_tokens() -> dict:
+    try:
+        with open(TOKENS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_tokens(tokens: dict) -> None:
+    directory = os.path.dirname(TOKENS_FILE) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tokens-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(tokens, f)
+        os.replace(tmp, TOKENS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def token_valid(token: str) -> bool:
+    if not token:
+        return False
+    m = _load_tokens().get(token)
+    if not m or m.get("used"):
+        return False
+    try:
+        return float(m.get("expires", 0)) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def mark_token_used(token: str, email: str) -> None:
+    tokens = _load_tokens()
+    if token in tokens:
+        tokens[token]["used"] = True
+        tokens[token]["email"] = email
+        _save_tokens(tokens)
+    _token_results[token] = email
+
+
 # ── 网页（无任何密钥，key 由用户输入后仅存 sessionStorage）────────────
 
 PAGE = """<!DOCTYPE html>
@@ -372,16 +434,24 @@ PAGE = """<!DOCTYPE html>
 <script>
 const stage=document.getElementById('stage'),view=document.getElementById('view'),
       statusEl=document.getElementById('status'),keyEl=document.getElementById('key');
+// v1.4.0：终端 --add-account 生成的链接带 ?token=，跳过填 Key 直接开窗
+const urlTok=new URLSearchParams(location.search).get('token')||'';
+if(urlTok){
+  document.getElementById('keyrow').style.display='none';
+  document.getElementById('hints').innerHTML='这是终端生成的一次性导号链接（已自动验证，15 分钟内有效）。'+
+    '<br>登录窗口正在打开 —— 在里面登录 muse.ai，看到「导入成功」就好了。';
+}
 keyEl.value=sessionStorage.getItem('mvw_key')||'';
 let ws=null,again=false;
 function say(t,cls){statusEl.textContent=t;statusEl.className=cls||'';}
 function start(){
   const key=keyEl.value.trim();
-  if(!key){say('先填 API Key','err');return;}
-  sessionStorage.setItem('mvw_key',key);
+  if(!urlTok&&!key){say('先填 API Key','err');return;}
+  if(!urlTok)sessionStorage.setItem('mvw_key',key);
   document.getElementById('start').disabled=true;
   say('正在启动登录窗口…');
-  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?key='+encodeURIComponent(key));
+  const q=urlTok?'token='+encodeURIComponent(urlTok):'key='+encodeURIComponent(key);
+  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?'+q);
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==='frame'){stage.style.display='block';view.src='data:image/jpeg;base64,'+m.data;}
@@ -396,8 +466,9 @@ function start(){
   };
   ws.onclose=()=>{if(statusEl.className!=='ok'){say('连接断开了，刷新页面重试','err');
     document.getElementById('start').disabled=false;}};
-  ws.onerror=()=>say('× 连接失败（Key 不对？服务没起来？）','err');
+  ws.onerror=()=>say(urlTok?'× 连接失败（链接过期了？回终端重新跑 --add-account 生成一条新的）':'× 连接失败（Key 不对？服务没起来？）','err');
 }
+if(urlTok)start();
 function pos(e){const r=view.getBoundingClientRect();
   return{x:Math.round((e.clientX-r.left)*__W__/r.width),
          y:Math.round((e.clientY-r.top)*__H__/r.height)};}
@@ -433,10 +504,49 @@ async def healthz():
     return {"ok": True, "service": "mvw-importer"}
 
 
+@app.get("/api/token_status")
+async def token_status(token: str = ""):
+    """终端 install.sh --add-account 的轮询端点（只经回环调用）。
+
+    状态机：pending（已生成没人开）→ active（浏览器已连上）
+            → done（导入成功，带 email）；expired / unknown 为终态异常。
+    """
+    if not token:
+        return {"state": "unknown"}
+    if token in _token_results:
+        return {"state": "done", "email": _token_results[token]}
+    m = _load_tokens().get(token)
+    if not m:
+        return {"state": "unknown"}
+    if m.get("used"):
+        return {"state": "done", "email": m.get("email", "")}
+    try:
+        if float(m.get("expires", 0)) <= time.time():
+            return {"state": "expired"}
+    except (TypeError, ValueError):
+        return {"state": "unknown"}
+    if token in _active_tokens:
+        return {"state": "active"}
+    return {"state": "pending"}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     key = ws.query_params.get("key", "")
-    if not API_KEY or not hmac.compare_digest(key, API_KEY):
+    token = ws.query_params.get("token", "")
+    via_token = False
+    if key and API_KEY and hmac.compare_digest(key, API_KEY):
+        pass  # 主 Key 通道（网页手填 Key 的老方式，长期有效）
+    elif token and token_valid(token):
+        # ⚠️ 令牌在导入成功前允许刷新重连（不因断开而作废），但同一时刻
+        #    只允许一个窗口占用 —— 防止链接被转发后多人同时开。
+        if token in _active_tokens:
+            await ws.accept()
+            await ws.send_json({"type": "error", "text": "这条链接已经在另一个窗口打开了"})
+            await ws.close()
+            return
+        via_token = True
+    else:
         await ws.close(code=4401)
         return
     if _busy.locked():
@@ -445,6 +555,8 @@ async def ws_endpoint(ws: WebSocket):
                             "text": "正有人在用导入窗口，稍等一会再刷新"})
         await ws.close()
         return
+    if via_token:
+        _active_tokens.add(token)
     await ws.accept()
     async with _busy:
         session: BrowserSession | None = None
@@ -524,6 +636,10 @@ async def ws_endpoint(ws: WebSocket):
                             continue  # 登录中转态，等页面稳定
                         label = email
                         await loop.run_in_executor(None, import_account, label, cookies)
+                        if via_token:
+                            # 导入成功 = 令牌使命完成，即刻作废；
+                            # 终端的 --add-account 轮询 /api/token_status 会拿到结果
+                            await loop.run_in_executor(None, mark_token_used, token, label)
                         await ws.send_json({
                             "type": "done", "label": label, "count": pool_count()})
                     except WebSocketDisconnect:
@@ -547,6 +663,8 @@ async def ws_endpoint(ws: WebSocket):
         finally:
             if session:
                 await asyncio.get_running_loop().run_in_executor(None, session.kill)
+            if via_token:
+                _active_tokens.discard(token)
 
 
 if __name__ == "__main__":
