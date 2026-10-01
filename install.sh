@@ -58,7 +58,7 @@ if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
   fi
 fi
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 # 前缀统一用 mvw-（Muse Video Workbench），避免和用户已有的 muse-video / muse2api
 # 等同名服务撞车 —— 曾因默认名与既有服务的 unit 重名，把别人的服务覆盖掉。
 APP_NAME="mvw"
@@ -66,6 +66,8 @@ APP_LABEL="Muse 视频工作台"
 DEFAULT_DIR="/opt/mvw"
 DEFAULT_API_PORT=18610
 DEFAULT_WEB_PORT=8090
+# v1.3.0：一键导号 sidecar（网页里登录 muse.ai，cookie 自动入库）的端口
+DEFAULT_IMPORT_PORT=18620
 # 装哪一份 muse2api？
 #   指向自己的 fork —— 它基于上游 v1.5.2，并叠加了 11 项缺陷修复
 #   （FIFO 队列调度 / CDP 单读循环 / 参数校验 / 405 鉴权绕过等）。
@@ -119,6 +121,7 @@ DO_HELP=0
 INSTALL_DIR="${INSTALL_DIR_SELF:-$DEFAULT_DIR}"
 API_PORT=""
 WEB_PORT=""
+IMPORT_PORT=""
 DOMAIN=""
 NO_DOMAIN=0
 ADV_GIVEN=0
@@ -145,6 +148,7 @@ ${APP_LABEL} 一键安装脚本 v${SCRIPT_VERSION}
   --dir <路径>         安装到哪个目录（默认 ${DEFAULT_DIR}）
   --api-port <端口>    接口服务端口（默认自动挑，常用 ${DEFAULT_API_PORT}）
   --web-port <端口>    网页端口（默认自动挑，常用 ${DEFAULT_WEB_PORT}）
+  --import-port <端口> 一键导号端口（默认自动挑，常用 ${DEFAULT_IMPORT_PORT}）
   --domain <域名>      给网页绑个域名并自动配 HTTPS（需要域名已解析到本机）
   --no-domain          不要域名（默认就是不要）
   --no-deps            不自动安装依赖，缺什么只告诉你
@@ -239,6 +243,8 @@ while [ $# -gt 0 ]; do
     --api-port=*)    API_PORT="${1#*=}"; [ -n "$API_PORT" ] || die "--api-port= 后面要跟一个端口号"; ADV_GIVEN=1 ;;
     --web-port)      WEB_PORT="${2:-}"; shift; [ -n "${WEB_PORT:-}" ] || die "--web-port 后面要跟一个端口号（比如 --web-port 8090）"; ADV_GIVEN=1 ;;
     --web-port=*)    WEB_PORT="${1#*=}"; [ -n "$WEB_PORT" ] || die "--web-port= 后面要跟一个端口号"; ADV_GIVEN=1 ;;
+    --import-port)      IMPORT_PORT="${2:-}"; shift; [ -n "${IMPORT_PORT:-}" ] || die "--import-port 后面要跟一个端口号（比如 --import-port 18620）"; ADV_GIVEN=1 ;;
+    --import-port=*)    IMPORT_PORT="${1#*=}"; [ -n "$IMPORT_PORT" ] || die "--import-port= 后面要跟一个端口号"; ADV_GIVEN=1 ;;
     --domain)        DOMAIN="${2:-}"; shift; [ -n "${DOMAIN:-}" ] || die "--domain 后面要跟一个域名（比如 --domain video.example.com）"; ADV_GIVEN=1 ;;
     --domain=*)      DOMAIN="${1#*=}"; [ -n "$DOMAIN" ] || die "--domain= 后面要跟一个域名"; ADV_GIVEN=1 ;;
     --no-domain)     NO_DOMAIN=1; ADV_GIVEN=1 ;;
@@ -268,11 +274,19 @@ validate_port() {
 }
 validate_port "$API_PORT" "接口端口"
 validate_port "$WEB_PORT" "网页端口"
+validate_port "$IMPORT_PORT" "导号端口"
 
 # 端口别撞车
 if [ -n "$API_PORT" ] && [ -n "$WEB_PORT" ] && [ "$API_PORT" = "$WEB_PORT" ]; then
   die "接口端口和网页端口不能是同一个（都是 $API_PORT）。给它们各分一个。"
 fi
+for _pair in "$API_PORT $IMPORT_PORT 接口 导号" "$WEB_PORT $IMPORT_PORT 网页 导号"; do
+  set -- $_pair
+  if [ -n "$1" ] && [ -n "$2" ] && [ "$1" = "$2" ]; then
+    die "$3端口和$4端口不能是同一个（都是 $1）。给它们各分一个。"
+  fi
+done
+unset _pair
 
 # 子命令互斥检查：--status / --uninstall / --upgrade 只能给一个
 _SUB_CNT=0
@@ -470,15 +484,15 @@ port_owned_by_us() {
 #   1) 从起始端口往上走 —— 端口号挨得近，好记好说明
 #   2) 连续 50 个都被占 → 说明这段被人密集占了，换高位段（20000-61000）
 #      随机探测，不再一个一个傻扫
-#   3) exclude：本轮已经定下来的另一个端口 —— API 和网页端口绝不能挑成
-#      同一个（默认端口被顶开之后是可能凑到一起的，别赌运气）
+#   3) exclude：本轮已经定下来的其他端口（空格分隔列表）—— 三个端口
+#      绝不能挑成同一个（默认端口被顶开之后是可能凑到一起的，别赌运气）
 pick_port() {
   local start="$1" exclude="${2:-}"
   local p="$start" tries=0 moved=0
   while :; do
     # 起点可能来自上一端口的 +1（如 65535 被占后来到 65536），先夹回合法段
     if [ "$p" -gt 65535 ]; then p=$(( (RANDOM % 41000) + 20000 )); fi
-    if [ "$p" != "$exclude" ]; then
+    case " $exclude " in *" $p "*) ;; *)
       if port_free "$p"; then
         printf '%s' "$p"
         return 0
@@ -487,8 +501,8 @@ pick_port() {
       if port_owned_by_us "$p"; then
         printf '%s' "$p"
         return 0
-      fi
-    fi
+      fi ;;
+    esac
     # ⚠️ 文案分两种：
     #    真实安装时说「已被占用，换一个」是对的（脚本真的会自动往上找）；
     #    但在 dry-run 里这么说会让小白**误以为必须自己手动换端口** ——
@@ -524,10 +538,10 @@ pick_port() {
 #     无人值守/CI 里这就是卡死点；现在自愈，不再挡路。
 resolve_port() {
   local p="$1" what="$2" exclude="${3:-}"
-  if [ "$p" != "$exclude" ]; then
+  case " $exclude " in *" $p "*) ;; *)
     if port_free "$p"; then printf '%s' "$p"; return 0; fi
-    if port_owned_by_us "$p"; then printf '%s' "$p"; return 0; fi
-  fi
+    if port_owned_by_us "$p"; then printf '%s' "$p"; return 0; fi ;;
+  esac
   warn "你指定的${what}端口 $p 已被别的程序占用，自动换一个空闲的"
   say "    （查是谁占的：sudo ss -lntp | grep :$p）"
   pick_port "$((p + 1))" "$exclude"
@@ -738,6 +752,7 @@ load_state() {
     case "$k" in
       API_PORT) [ -z "$API_PORT" ] && API_PORT="$v"; got=1 ;;
       WEB_PORT) [ -z "$WEB_PORT" ] && WEB_PORT="$v"; got=1 ;;
+      IMPORT_PORT) [ -z "$IMPORT_PORT" ] && IMPORT_PORT="$v"; got=1 ;;
       DOMAIN)   [ "$NO_DOMAIN" != 1 ] && [ -z "$DOMAIN" ] && DOMAIN="$v"; got=1 ;;
       # 把上次的 Key 读回来，重跑时复用它 —— 否则会生成新 Key，
       # 导致所有已配置的客户端和导号脚本全部失效（实测踩过）。
@@ -766,6 +781,7 @@ save_state() {
 INSTALL_DIR=$INSTALL_DIR
 API_PORT=$API_PORT
 WEB_PORT=$WEB_PORT
+IMPORT_PORT=$IMPORT_PORT
 DOMAIN=$DOMAIN
 API_KEY=$API_KEY
 INSTALLED_AT=$(date +%s)
@@ -930,6 +946,575 @@ gen_key() {
   printf 'm2a_%s' "$k"
 }
 
+
+# v1.3.0：把导号 sidecar 写进安装目录（compose 以只读卷挂载进容器）。
+# ⚠️ 内嵌全文、不依赖网络 —— 单文件安装（curl 一个 install.sh 就跑完）是本
+#    脚本的立身之本，不能为这一个文件破例。仓库里也单独存了一份
+#    import_sidecar.py 供审阅，两边内容必须一致。
+write_importer() {
+  local dir="$1"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '    %s[dry-run]%s 写入 %s/import_sidecar.py\n' "$C_CYN" "$C_OFF" "$dir"
+    return 0
+  fi
+  umask 022
+  cat > "$dir/import_sidecar.py" <<'MUSEIMPORT'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Muse 视频工作台 · 网页一键导号 sidecar（v1.3.0）
+
+干什么用：
+    原版导号要在用户自己的电脑上装 Python、跑脚本、手填服务器地址和 Key。
+    这个 sidecar 把「登录 muse.ai」整个搬进网页 —— 它在本容器里起一个无头
+    Chromium，把页面画面实时投屏到用户的浏览器（CDP screencast），用户的
+    鼠标键盘操作转发回去。用户在里面登录 muse.ai，session cookie 一出现就
+    自动抓下来、自动注册进 muse2api 账号池。用户全程只需要一个浏览器。
+
+安全模型：
+    · 网页本身不含任何密钥（连 HTML 都是公开无害的）
+    · WebSocket 连接必须带 ?key=<MUSE2API_KEY>，与 compose 注入的环境变量比对
+    · cookie 只经本机回环进账号池，不落地、不外发
+
+依赖：复用 muse2api 镜像（chromium + python + fastapi/uvicorn 都在），
+    零额外下载。本文件由 install.sh 的 write_importer() 写入安装目录，
+    compose 以只读卷挂载进来。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hmac
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+import urllib.request
+import urllib.error
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
+
+# ── 配置（compose 注入）──────────────────────────────────────────────
+API_KEY = os.environ.get("MUSE2API_KEY", "")
+API_BASE = os.environ.get(
+    "MUSE2API_INTERNAL_BASE",
+    # ⚠️ 默认 bridge 网络上容器间没有名字 DNS，但宿主的网关 IP 永远可达，
+    #    而 API 发布在 0.0.0.0 上 —— 走网关 IP 即回到本机 API 端口。
+    f"http://172.17.0.1:{os.environ.get('MUSE2API_PORT', '18610')}",
+)
+IMPORT_PORT = int(os.environ.get("IMPORT_PORT", "18620"))
+CHROMIUM = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
+CDP_PORT = 19999  # 容器内回环端口，不发布
+LOGIN_URL = "https://muse.ai/login"
+DOMAIN_HINT = "muse.ai"
+SESSION_COOKIE = "hatch_sess"     # 登录成功后必然出现的会话 cookie
+VIEW_W, VIEW_H = 1280, 800
+IDLE_TIMEOUT = 600                # 无操作 10 分钟自动回收浏览器
+
+# ── 极简 WebSocket 客户端（RFC6455 文本帧，stdlib，供 CDP 用）────────
+#    与上游 tools/get_muse_cookie.py 里的 WS 同族：容器里没有 websocket-client，
+#    自己实现一个 100 行以内的够用品。
+
+
+class WS:
+    def __init__(self, url: str, timeout: float = 15.0):
+        assert url.startswith("ws://"), url
+        rest = url[5:]
+        hostport, _, path = rest.partition("/")
+        path = "/" + path
+        host, _, port = hostport.partition(":")
+        self.sock = socket.create_connection((host, int(port or 80)), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket 握手失败")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise ConnectionError("WebSocket 握手被拒绝")
+        self._id = 0
+        self.sock.settimeout(timeout)
+
+    def _frame(self, payload: bytes):
+        head = bytearray([0x81])
+        n = len(payload)
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head.append(0x80 | 126)
+            head += struct.pack(">H", n)
+        else:
+            head.append(0x80 | 127)
+            head += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        head += mask
+        self.sock.sendall(bytes(head) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _read(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("WebSocket 断开")
+            buf += chunk
+        return buf
+
+    def recv_msg(self) -> dict:
+        payload = b""
+        while True:
+            b1, b2 = self._read(2)
+            fin = b1 & 0x80
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            if b2 & 0x80:  # 服务端→客户端不掩码，防御性处理
+                mask = self._read(4)
+                data = bytes(x ^ mask[i % 4] for i, x in enumerate(self._read(n)))
+            else:
+                data = self._read(n)
+            payload += data
+            if fin:
+                return json.loads(payload.decode("utf-8", "replace"))
+
+    def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+        self._id += 1
+        mid = self._id
+        self._frame(json.dumps({"id": mid, "method": method,
+                                "params": params or {}}).encode())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.recv_msg()
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"CDP {method}: {msg['error']}")
+                return msg.get("result", {})
+        raise TimeoutError(f"CDP {method} 超时")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# ── 无头浏览器会话 ────────────────────────────────────────────────────
+
+
+class BrowserSession:
+    """一个无头 Chromium 实例 + 两条 CDP 通道（页面级/浏览器级）。"""
+
+    def __init__(self, profile_dir: str):
+        self.profile_dir = profile_dir
+        self.proc = subprocess.Popen([
+            CHROMIUM, "--headless=new", "--no-sandbox", "--disable-gpu",
+            "--disable-dev-shm-usage", f"--remote-debugging-port={CDP_PORT}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={profile_dir}",
+            f"--window-size={VIEW_W},{VIEW_H}",
+            "--lang=zh-CN", LOGIN_URL,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.page_ws: WS | None = None
+        self.browser_ws: WS | None = None
+        self._connect()
+
+    def _wait_cdp(self, timeout: float = 30.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=2) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                time.sleep(0.4)
+        raise RuntimeError("Chromium CDP 没起来")
+
+    def _connect(self):
+        self._wait_cdp()
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=5) as r:
+            ver = json.loads(r.read().decode())
+        self.browser_ws = WS(ver["webSocketDebuggerUrl"])
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json", timeout=5) as r:
+            targets = json.loads(r.read().decode())
+        page = next(t for t in targets if t.get("type") == "page"
+                    and DOMAIN_HINT in (t.get("url") or ""))
+        self.page_ws = WS(page["webSocketDebuggerUrl"])
+        self.page_ws.call("Page.enable")
+        self.page_ws.call("Emulation.setDeviceMetricsOverride", {
+            "width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": 1, "mobile": False})
+
+    def start_screencast(self):
+        self.page_ws.call("Page.startScreencast", {
+            "format": "jpeg", "quality": 60,
+            "maxWidth": VIEW_W, "maxHeight": VIEW_H, "everyNthFrame": 1})
+
+    def stop_screencast(self):
+        try:
+            self.page_ws.call("Page.stopScreencast")
+        except Exception:
+            pass
+
+    def ack(self, session_id: int):
+        try:
+            self.page_ws.call("Page.screencastFrameAck", {"sessionId": session_id})
+        except Exception:
+            pass
+
+    def cookies(self) -> dict[str, dict]:
+        res = self.browser_ws.call("Storage.getCookies", {}, timeout=10)
+        out = {}
+        for c in res.get("cookies", []):
+            if DOMAIN_HINT not in (c.get("domain") or ""):
+                continue
+            name = c.get("name")
+            if not name:
+                continue
+            try:
+                exp = int(float(c.get("expires", -1)))
+            except (TypeError, ValueError):
+                exp = -1
+            out[name] = {"value": c.get("value", ""), "expires": exp}
+        return out
+
+    def login_email(self) -> str:
+        try:
+            r = self.page_ws.call("Runtime.evaluate", {
+                "expression": (
+                    "(function(){try{"
+                    "var m=document.querySelector('meta[name=user-email]');"
+                    "if(m&&m.content)return m.content;"
+                    "var t=document.body?document.body.innerText:'';"
+                    "var x=t.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);"
+                    "return x?x[0]:'';}catch(e){return '';}})()"
+                ), "returnByValue": True}, timeout=8)
+            return str((r.get("result") or {}).get("value") or "").strip()
+        except Exception:
+            return ""
+
+    def dispatch_mouse(self, ev: dict):
+        p = {"x": ev["x"], "y": ev["y"]}
+        kind = ev["kind"]
+        if kind == "move":
+            p["type"] = "mouseMoved"
+        elif kind == "down":
+            p.update(type="mousePressed", button="left", clickCount=1)
+        elif kind == "up":
+            p.update(type="mouseReleased", button="left", clickCount=1)
+        elif kind == "wheel":
+            p.update(type="mouseWheel", deltaX=ev.get("dx", 0), deltaY=ev.get("dy", 0))
+        else:
+            return
+        self.page_ws.call("Input.dispatchMouseEvent", p, timeout=5)
+
+    _KEYMAP = {"Enter": 13, "Backspace": 8, "Tab": 9, "Escape": 27,
+               "Delete": 46, "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34,
+               "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40}
+
+    def dispatch_key(self, ev: dict):
+        key = ev.get("key", "")
+        if len(key) == 1:  # 可打印字符：insertText 最稳（含非 ASCII）
+            self.page_ws.call("Input.insertText", {"text": key}, timeout=5)
+            return
+        code = self._KEYMAP.get(key)
+        if code is None:
+            return
+        for t in ("rawKeyDown", "keyUp"):
+            self.page_ws.call("Input.dispatchKeyEvent", {
+                "type": t, "key": key, "code": key,
+                "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code}, timeout=5)
+
+    def kill(self):
+        self.stop_screencast()
+        for ws in (self.page_ws, self.browser_ws):
+            if ws:
+                ws.close()
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ── 账号池 API ────────────────────────────────────────────────────────
+
+
+def _api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    url = API_BASE.rstrip("/") + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read().decode("utf-8", "replace")
+        return json.loads(body) if body.strip() else {}
+
+
+def pool_count() -> int:
+    try:
+        r = _api("/admin/accounts")
+        if isinstance(r, list):
+            return len(r)
+        for k in ("accounts", "items", "data", "list"):
+            v = r.get(k)
+            if isinstance(v, list):
+                return len(v)
+    except Exception:
+        pass
+    return -1
+
+
+def import_account(label: str, cookies: dict[str, dict]) -> dict:
+    return _api("/admin/accounts", "POST", {
+        "label": label,
+        "cookies": {k: v["value"] for k, v in cookies.items()},
+        "expires": {k: v["expires"] for k, v in cookies.items() if v["expires"] > 0},
+    })
+
+
+# ── 网页（无任何密钥，key 由用户输入后仅存 sessionStorage）────────────
+
+PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>导入 muse.ai 账号</title>
+<style>
+  body{margin:0;font-family:system-ui,sans-serif;background:#1c1c1e;color:#eee;
+       display:flex;flex-direction:column;align-items:center;min-height:100vh}
+  .bar{width:100%;max-width:__W__px;padding:10px 14px;box-sizing:border-box}
+  h1{font-size:16px;margin:8px 0}
+  .hint{font-size:13px;color:#9a9aa0;line-height:1.7}
+  #keyrow{display:flex;gap:8px;margin:10px 0}
+  input{flex:1;padding:9px 12px;border-radius:8px;border:1px solid #3a3a3e;
+        background:#2c2c2e;color:#eee;font-size:14px;outline:none}
+  button{padding:9px 16px;border-radius:8px;border:0;background:#0a84ff;
+         color:#fff;font-size:14px;cursor:pointer}
+  button:disabled{background:#3a3a3e;cursor:default}
+  #stage{display:none;position:relative;border-radius:10px;overflow:hidden;
+         box-shadow:0 8px 40px rgba(0,0,0,.5)}
+  #view{display:block;cursor:pointer;background:#000}
+  #status{padding:10px 14px;font-size:14px;min-height:20px}
+  .ok{color:#30d158}.err{color:#ff453a}
+</style></head><body>
+<div class="bar">
+  <h1>导入 muse.ai 账号 → 视频工作台</h1>
+  <div class="hint" id="hints">
+    ① 粘贴 API Key（--status 能看到）→ ② 点「打开登录窗口」→
+    ③ 在下面的窗口里登录 muse.ai → ④ 看到「导入成功」就好了。
+    想加第二个账号，登录成功后点「再导一个」。
+  </div>
+  <div id="keyrow">
+    <input id="key" type="password" placeholder="API Key（形如 m2a_xxxx…）">
+    <button id="start" onclick="start()">打开登录窗口</button>
+  </div>
+  <div id="stage">
+    <img id="view" width="__W__" height="__H__" alt="登录窗口加载中…">
+  </div>
+  <div id="status"></div>
+</div>
+<script>
+const stage=document.getElementById('stage'),view=document.getElementById('view'),
+      statusEl=document.getElementById('status'),keyEl=document.getElementById('key');
+keyEl.value=sessionStorage.getItem('mvw_key')||'';
+let ws=null,again=false;
+function say(t,cls){statusEl.textContent=t;statusEl.className=cls||'';}
+function start(){
+  const key=keyEl.value.trim();
+  if(!key){say('先填 API Key','err');return;}
+  sessionStorage.setItem('mvw_key',key);
+  document.getElementById('start').disabled=true;
+  say('正在启动登录窗口…');
+  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?key='+encodeURIComponent(key));
+  ws.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='frame'){stage.style.display='block';view.src='data:image/jpeg;base64,'+m.data;}
+    else if(m.type==='info'){say(m.text);}
+    else if(m.type==='done'){
+      say('✓ 导入成功：'+m.label+(m.count>=0?'（账号池现有 '+m.count+' 个）':''),'ok');
+      const b=document.createElement('button');b.textContent='再导一个账号';
+      b.style.marginLeft='10px';b.onclick=()=>{b.remove();say('正在重置窗口…');ws.send(JSON.stringify({kind:'again'}));};
+      statusEl.appendChild(b);
+    }
+    else if(m.type==='error'){say('× '+m.text,'err');document.getElementById('start').disabled=false;}
+  };
+  ws.onclose=()=>{if(statusEl.className!=='ok'){say('连接断开了，刷新页面重试','err');
+    document.getElementById('start').disabled=false;}};
+  ws.onerror=()=>say('× 连接失败（Key 不对？服务没起来？）','err');
+}
+function pos(e){const r=view.getBoundingClientRect();
+  return{x:Math.round((e.clientX-r.left)*__W__/r.width),
+         y:Math.round((e.clientY-r.top)*__H__/r.height)};}
+view.addEventListener('mousemove',e=>{if(ws&&ws.readyState===1){const p=pos(e);
+  ws.send(JSON.stringify({kind:'move',...p}));}});
+view.addEventListener('mousedown',e=>{const p=pos(e);
+  ws.send(JSON.stringify({kind:'down',...p}));});
+view.addEventListener('mouseup',e=>{const p=pos(e);
+  ws.send(JSON.stringify({kind:'up',...p}));});
+view.addEventListener('wheel',e=>{e.preventDefault();const p=pos(e);
+  ws.send(JSON.stringify({kind:'wheel',...p,dx:e.deltaX,dy:e.deltaY}));},{passive:false});
+document.addEventListener('keydown',e=>{
+  if(!ws||ws.readyState!==1||document.activeElement===keyEl)return;
+  if(e.key.length===1||['Enter','Backspace','Tab','Escape','Delete','Home','End',
+     'PageUp','PageDown','ArrowLeft','ArrowUp','ArrowRight','ArrowDown'].includes(e.key)){
+    e.preventDefault();ws.send(JSON.stringify({kind:'key',key:e.key}));}});
+</script></body></html>""".replace("__W__", str(VIEW_W)).replace("__H__", str(VIEW_H))
+
+
+# ── FastAPI 服务 ──────────────────────────────────────────────────────
+
+app = FastAPI()
+_busy = asyncio.Lock()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return PAGE
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "service": "mvw-importer"}
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    key = ws.query_params.get("key", "")
+    if not API_KEY or not hmac.compare_digest(key, API_KEY):
+        await ws.close(code=4401)
+        return
+    if _busy.locked():
+        await ws.accept()
+        await ws.send_json({"type": "error",
+                            "text": "正有人在用导入窗口，稍等一会再刷新"})
+        await ws.close()
+        return
+    await ws.accept()
+    async with _busy:
+        session: BrowserSession | None = None
+        loop = asyncio.get_running_loop()
+        try:
+            profile = tempfile.mkdtemp(prefix="muse-login-")
+            try:
+                session = await loop.run_in_executor(None, BrowserSession, profile)
+            except Exception as e:
+                await ws.send_json({"type": "error", "text": f"浏览器启动失败：{e}"})
+                return
+            await ws.send_json({"type": "info", "text": "登录窗口就绪，在里面登录 muse.ai"})
+            await loop.run_in_executor(None, session.start_screencast)
+
+            stop = asyncio.Event()
+            last_active = time.time()
+
+            async def frames_out():
+                """CDP 画面帧 → 浏览器（阻塞 socket 放线程里跑）。"""
+                while not stop.is_set():
+                    try:
+                        msg = await loop.run_in_executor(None, session.page_ws.recv_msg)
+                    except Exception:
+                        stop.set()
+                        return
+                    if msg.get("method") == "Page.screencastFrame":
+                        p = msg.get("params", {})
+                        session.ack(p.get("sessionId", 0))
+                        try:
+                            await ws.send_json({"type": "frame", "data": p.get("data", "")})
+                        except Exception:
+                            stop.set()
+                            return
+                    if time.time() - last_active > IDLE_TIMEOUT:
+                        await ws.send_json({"type": "error", "text": "闲置太久，窗口已回收，刷新重来"})
+                        stop.set()
+                        return
+
+            async def input_in():
+                """浏览器输入事件 → CDP。"""
+                nonlocal last_active
+                while not stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.receive_text(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    except WebSocketDisconnect:
+                        stop.set()
+                        return
+                    last_active = time.time()
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:
+                        continue
+                    kind = ev.get("kind")
+                    try:
+                        if kind == "again":
+                            # 重置：换干净 profile 重启，继续同一条 ws
+                            await loop.run_in_executor(None, _reset_browser, session)
+                        elif kind == "key":
+                            await loop.run_in_executor(None, session.dispatch_key, ev)
+                        else:
+                            await loop.run_in_executor(None, session.dispatch_mouse, ev)
+                    except Exception:
+                        pass
+
+            async def cookie_watch():
+                """盯 session cookie：出现 → 自动抓全量 → 自动注册账号池。"""
+                while not stop.is_set():
+                    await asyncio.sleep(2.0)
+                    try:
+                        cookies = await loop.run_in_executor(None, session.cookies)
+                        if SESSION_COOKIE not in cookies:
+                            continue
+                        email = await loop.run_in_executor(None, session.login_email)
+                        if not email:
+                            continue  # 登录中转态，等页面稳定
+                        label = email
+                        await loop.run_in_executor(None, import_account, label, cookies)
+                        await ws.send_json({
+                            "type": "done", "label": label, "count": pool_count()})
+                    except WebSocketDisconnect:
+                        stop.set()
+                        return
+                    except Exception:
+                        pass
+
+            def _reset_browser(sess: BrowserSession):
+                sess.kill()
+                new_profile = tempfile.mkdtemp(prefix="muse-login-")
+                ns = BrowserSession(new_profile)
+                sess.__dict__.update(ns.__dict__)
+                sess.start_screencast()
+
+            tasks = [asyncio.create_task(t()) for t in
+                     (frames_out, input_in, cookie_watch)]
+            await stop.wait()
+            for t in tasks:
+                t.cancel()
+        finally:
+            if session:
+                await asyncio.get_running_loop().run_in_executor(None, session.kill)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=IMPORT_PORT, log_level="warning")
+MUSEIMPORT
+}
+
 write_compose() {
   local dir="$1"
   local compose_file="$dir/docker-compose.yml"
@@ -975,6 +1560,31 @@ services:
       - MUSE2API_CHAT_TIMEOUT=300
     volumes:
       - ./data:/app/data
+    shm_size: '2gb'
+
+  # v1.3.0 一键导号 sidecar —— 网页里登录 muse.ai，cookie 自动进账号池
+  # ⚠️ 复用同一个镜像（build 同一份代码，第二次构建全部命中缓存，零额外下载）：
+  #    镜像里本来就有 chromium + python + uvicorn，sidecar 只是换个启动命令。
+  importer:
+    build: .
+    image: ${CONTAINER_NAME}:latest
+    container_name: ${CONTAINER_NAME}-import
+    restart: always
+    network_mode: bridge
+    depends_on:
+      - muse2api
+    ports:
+      - "${IMPORT_PORT}:${IMPORT_PORT}"
+    command: ["sh", "-c", "cd /app && python -m uvicorn import_sidecar:app --host 0.0.0.0 --port ${IMPORT_PORT}"]
+    environment:
+      # ⚠️ Key 只进容器环境变量，绝不写进网页 —— 网页端靠用户手动粘贴 Key 鉴权
+      - MUSE2API_KEY=${API_KEY}
+      - MUSE2API_PORT=${API_PORT}
+      - IMPORT_PORT=${IMPORT_PORT}
+      - CHROMIUM_BIN=/usr/bin/chromium
+    volumes:
+      # 由 write_importer() 写入安装目录，只读挂载进容器
+      - ./import_sidecar.py:/app/import_sidecar.py:ro
     shm_size: '2gb'
 EOF
   chmod 600 "$compose_file"
@@ -1579,27 +2189,18 @@ print_next_steps() {
   fi
   say ""
   say "  ${C_BLD}② 导入 muse.ai 账号（必须先做这步，否则生成不了）${C_OFF}"
-  say "     视频工作台靠 muse.ai 的账号来出片，所以得先给它一个账号。"
-  say "     这台服务器上没有浏览器，所以要在${C_BLD}你自己的电脑${C_OFF}上做。"
+  say "     浏览器打开这个网址："
+  if [ -n "$DOMAIN" ]; then
+    say "        http://${IP}:${IMPORT_PORT}/    ${C_DIM}（导号窗口走独立端口，不走域名）${C_OFF}"
+  else
+    say "        http://${IP}:${IMPORT_PORT}/"
+  fi
+  say "     粘贴上面的 API Key → 点「打开登录窗口」→ 在网页里的窗口登录 muse.ai → 完成。"
+  say "     ${C_BLD}全程只需要浏览器${C_OFF} —— 登录窗口跑在服务器上，cookie 自动入库，"
+  say "     不用装 Python、不用下载任何工具、不用手填地址。"
+  say "     想加第二个账号，导入成功后点「再导一个」。"
   say ""
-  say "     ${C_BLD}第 1 步${C_OFF} 下载这个小工具（普通网页文件，双击不会执行，安全）："
-  say "        https://raw.githubusercontent.com/${SELF_REPO}/main/tools/get_muse_cookie.py"
-  say "        （存到桌面就行，名字保持 get_muse_cookie.py）"
-  say ""
-  say "     ${C_BLD}第 2 步${C_OFF} 在你的电脑上打开命令行，敲这一条（会自动弹出浏览器）："
-  say "        python get_muse_cookie.py"
-  say ""
-  say "        它只问你两件事，照着填就行："
-  say "          服务器地址（形如 1.2.3.4:18610）：${IP}:${API_PORT}"
-  say "          API Key：${API_KEY}"
-  say ""
-  say "        ${C_DIM}（上面两条可以直接从这里复制过去；它也记住了，下次直接回车）${C_OFF}"
-  say ""
-  say "     ${C_BLD}第 3 步${C_OFF} 在弹出来的窗口里登录 muse.ai，看到「导入成功」就好了。"
-  say "        想导入第二个账号，它会问你要不要继续，按 y 即可。"
-  say ""
-  say "     ${C_DIM}没装 Python？搜「python 官网下载」，装的时候勾上 Add to PATH 就行。${C_OFF}"
-  say "     ${C_DIM}没装 Chrome？装 Edge（Windows 自带）也可以用。${C_OFF}"
+  say "     ${C_DIM}（老方法仍然可用：本机跑 tools/get_muse_cookie.py，需要装 Python）${C_OFF}"
   say ""
   say "  ${C_BLD}③ 回到网页，输入一句话测试${C_OFF}"
   say "     接口地址和 Key 已经自动填好了，直接写描述、点生成就行。"
@@ -1607,6 +2208,7 @@ print_next_steps() {
   printf '%s  ────────── 以下是详细信息，以后需要再查 ──────────%s\n\n' "$C_DIM" "$C_OFF"
   say "  网页地址：      http://${IP}:${WEB_PORT}/"
   say "  接口地址：      http://${IP}:${API_PORT}/v1"
+  say "  一键导号：      http://${IP}:${IMPORT_PORT}/"
   say "  API Key：       ${API_KEY}"
   say "  安装目录：      ${INSTALL_DIR}"
   say "  账号池面板：    http://${IP}:${API_PORT}/admin?key=${API_KEY}"
@@ -1631,7 +2233,7 @@ print_next_steps() {
   say ""
   say "  ${C_DIM}记不住 API Key？随时跑 --status 就能看回来。${C_OFF}"
   say ""
-  warn "如果网页打不开，多半是云服务商的安全组没放行 ${WEB_PORT} 和 ${API_PORT} 端口，去控制台加一下。"
+  warn "如果网页打不开，多半是云服务商的安全组没放行 ${WEB_PORT}、${API_PORT}、${IMPORT_PORT} 端口，去控制台加一下。"
   say ""
   dim "  验收清单："
   dim "    □ 网页 http://${IP}:${WEB_PORT}/ 能打开（左侧能看到「生成视频」按钮）"
@@ -1676,6 +2278,7 @@ do_install() {
   if [ "$DRY_RUN" = 1 ]; then
     [ -n "$API_PORT" ] || API_PORT="$DEFAULT_API_PORT"
     [ -n "$WEB_PORT" ] || WEB_PORT="$DEFAULT_WEB_PORT"
+    [ -n "$IMPORT_PORT" ] || IMPORT_PORT="$DEFAULT_IMPORT_PORT"
   else
     # ⚠️ python3 要在挑端口**之前**就位：端口检测的第 3 层（真实 bind 测试，
     #    见 port_bindable）依赖它。放在这里装，后面的安装流程就都能用上。
@@ -1693,6 +2296,12 @@ do_install() {
       WEB_PORT="$(pick_port "$DEFAULT_WEB_PORT" "$API_PORT")"
     else
       WEB_PORT="$(resolve_port "$WEB_PORT" "网页" "$API_PORT")"
+    fi
+    # v1.3.0 第三个端口：一键导号 sidecar
+    if [ -z "$IMPORT_PORT" ]; then
+      IMPORT_PORT="$(pick_port "$DEFAULT_IMPORT_PORT" "$API_PORT $WEB_PORT")"
+    else
+      IMPORT_PORT="$(resolve_port "$IMPORT_PORT" "导号" "$API_PORT $WEB_PORT")"
     fi
   fi
 
@@ -1761,6 +2370,7 @@ do_install() {
 
   step "写入配置"
   write_compose "$INSTALL_DIR"
+  write_importer "$INSTALL_DIR"
   write_webpage "$INSTALL_DIR"
   # 一次输出一整句，别拆成两条 —— 拆开会和 pick_port 的告警交错成乱码
   ok "配置完成：接口端口 $API_PORT，网页端口 $WEB_PORT"
@@ -1978,6 +2588,17 @@ do_status() {
     err "网页服务：没运行"
   fi
 
+  # v1.3.0 一键导号 sidecar
+  local imp_st
+  imp_st="$(docker inspect "${CONTAINER_NAME}-import" --format '{{.State.Status}}' 2>/dev/null | head -1)"
+  if [ "$imp_st" = "running" ]; then
+    ok "一键导号：运行中（端口 ${IMPORT_PORT}）"
+  elif [ -z "$imp_st" ]; then
+    warn "一键导号：没装（v1.3.0 新增 —— 重跑一次安装即可加上）"
+  else
+    err "一键导号：$imp_st（看日志：docker logs ${CONTAINER_NAME}-import --tail 40）"
+  fi
+
   # 关键信息：小白关掉安装窗口后，要能从这里把地址和 Key 找回来
   local k ip
   k="$(read_existing_key)"
@@ -1987,6 +2608,7 @@ do_status() {
   say "  ${C_BLD}连接信息${C_OFF}（配客户端、导号都用这些）"
   say "    网页地址：   http://${ip}:${WEB_PORT}/"
   say "    接口地址：   http://${ip}:${API_PORT}/v1"
+  say "    一键导号：   http://${ip}:${IMPORT_PORT}/"
   if [ -n "$k" ]; then
     say "    API Key：    ${k}"
     say "    账号池面板： http://${ip}:${API_PORT}/admin?key=${k}"
