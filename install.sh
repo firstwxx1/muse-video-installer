@@ -58,7 +58,7 @@ if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
   fi
 fi
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 # 前缀统一用 mvw-（Muse Video Workbench），避免和用户已有的 muse-video / muse2api
 # 等同名服务撞车 —— 曾因默认名与既有服务的 unit 重名，把别人的服务覆盖掉。
 APP_NAME="mvw"
@@ -966,7 +966,7 @@ write_importer() {
   cat > "$dir/import_sidecar.py" <<'MUSEIMPORT'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Muse 视频工作台 · 网页一键导号 sidecar（v1.4.0）
+"""Muse 视频工作台 · 网页一键导号 sidecar（v1.4.1）
 
 干什么用：
     原版导号要在用户自己的电脑上装 Python、跑脚本、手填服务器地址和 Key。
@@ -999,11 +999,13 @@ import base64
 import hmac
 import json
 import os
+import queue
 import shutil
 import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -1032,7 +1034,14 @@ IDLE_TIMEOUT = 600                # 无操作 10 分钟自动回收浏览器
 
 # ── 极简 WebSocket 客户端（RFC6455 文本帧，stdlib，供 CDP 用）────────
 #    与上游 tools/get_muse_cookie.py 里的 WS 同族：容器里没有 websocket-client，
-#    自己实现一个 100 行以内的够用品。
+#    自己实现一个够用品。
+#
+#    ⚠️ 读写分离（v1.4.1 修复的核心）：
+#    早期版本让多个线程各自 recv 同一条 socket —— 收帧线程阻塞等画面帧时，
+#    输入指令（Input.dispatch*）的响应包会被它当帧吃掉，指令线程永远等不到
+#    响应、超时、异常被静默吞掉。表现为：画面活着，点击/键盘全部无效。
+#    现在：一个后台 pump 线程独占 recv，带 id 的响应按 id 路由给等待中的
+#    call()，无 id 的事件交给注册的 handler。发送端加锁即可多线程并发 call。
 
 
 class WS:
@@ -1057,7 +1066,40 @@ class WS:
         if b" 101 " not in buf.split(b"\r\n")[0]:
             raise ConnectionError("WebSocket 握手被拒绝")
         self._id = 0
-        self.sock.settimeout(timeout)
+        self._send_lock = threading.Lock()
+        self._pending: dict[int, "queue.Queue"] = {}
+        self._handlers = []
+        self._closed = False
+        # pump 独占 recv；握手完成后转阻塞模式（靠 close() 唤醒），
+        # 不能用超时读 —— 超时会在半帧中间炸掉，字节流错位后整个连接就废了。
+        self.sock.settimeout(None)
+        self._pump = threading.Thread(target=self._pump_loop, daemon=True)
+        self._pump.start()
+
+    def on_event(self, handler):
+        """注册 CDP 事件回调（在 pump 线程里跑，别在里面做阻塞调用）。"""
+        self._handlers.append(handler)
+
+    def _pump_loop(self):
+        while not self._closed:
+            try:
+                msg = self.recv_msg()
+            except Exception:
+                break
+            mid = msg.get("id")
+            q = self._pending.pop(mid, None) if mid is not None else None
+            if q is not None:
+                q.put(msg)
+            else:
+                for h in list(self._handlers):
+                    try:
+                        h(msg)
+                    except Exception:
+                        pass
+        # 连接死了：唤醒所有还在等响应的调用者，别让它们傻等到超时
+        for q in list(self._pending.values()):
+            q.put(None)
+        self._pending.clear()
 
     def _frame(self, payload: bytes):
         head = bytearray([0x81])
@@ -1103,20 +1145,26 @@ class WS:
                 return json.loads(payload.decode("utf-8", "replace"))
 
     def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
-        self._id += 1
-        mid = self._id
-        self._frame(json.dumps({"id": mid, "method": method,
-                                "params": params or {}}).encode())
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self.recv_msg()
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise RuntimeError(f"CDP {method}: {msg['error']}")
-                return msg.get("result", {})
-        raise TimeoutError(f"CDP {method} 超时")
+        with self._send_lock:
+            self._id += 1
+            mid = self._id
+            q: "queue.Queue" = queue.Queue()
+            self._pending[mid] = q
+            self._frame(json.dumps({"id": mid, "method": method,
+                                    "params": params or {}}).encode())
+        try:
+            msg = q.get(timeout=timeout)
+        except queue.Empty:
+            self._pending.pop(mid, None)
+            raise TimeoutError(f"CDP {method} 超时")
+        if msg is None:
+            raise ConnectionError("WebSocket 断开")
+        if "error" in msg:
+            raise RuntimeError(f"CDP {method}: {msg['error']}")
+        return msg.get("result", {})
 
     def close(self):
+        self._closed = True
         try:
             self.sock.close()
         except Exception:
@@ -1131,6 +1179,8 @@ class BrowserSession:
 
     def __init__(self, profile_dir: str):
         self.profile_dir = profile_dir
+        # 画面帧队列：page_ws 的 pump 线程投进来，ws_endpoint 的 frames_out 消费
+        self.frame_q: "queue.Queue" = queue.Queue()
         self.proc = subprocess.Popen([
             CHROMIUM, "--headless=new", "--no-sandbox", "--disable-gpu",
             "--disable-dev-shm-usage", f"--remote-debugging-port={CDP_PORT}",
@@ -1167,9 +1217,15 @@ class BrowserSession:
         page = next(t for t in targets if t.get("type") == "page"
                     and DOMAIN_HINT in (t.get("url") or ""))
         self.page_ws = WS(page["webSocketDebuggerUrl"])
+        self.page_ws.on_event(self._on_page_event)
         self.page_ws.call("Page.enable")
         self.page_ws.call("Emulation.setDeviceMetricsOverride", {
             "width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": 1, "mobile": False})
+
+    def _on_page_event(self, msg: dict):
+        """pump 线程里跑：只投队列，绝不阻塞（ack 由消费线程补）。"""
+        if msg.get("method") == "Page.screencastFrame":
+            self.frame_q.put(msg.get("params", {}))
 
     def start_screencast(self):
         self.page_ws.call("Page.startScreencast", {
@@ -1225,9 +1281,10 @@ class BrowserSession:
         if kind == "move":
             p["type"] = "mouseMoved"
         elif kind == "down":
-            p.update(type="mousePressed", button="left", clickCount=1)
+            # buttons=1 标明左键正按着 —— 缺了这个，一些前端框架不认这次点击
+            p.update(type="mousePressed", button="left", clickCount=1, buttons=1)
         elif kind == "up":
-            p.update(type="mouseReleased", button="left", clickCount=1)
+            p.update(type="mouseReleased", button="left", clickCount=1, buttons=0)
         elif kind == "wheel":
             p.update(type="mouseWheel", deltaX=ev.get("dx", 0), deltaY=ev.get("dy", 0))
         else:
@@ -1541,16 +1598,21 @@ async def ws_endpoint(ws: WebSocket):
             last_active = time.time()
 
             async def frames_out():
-                """CDP 画面帧 → 浏览器（阻塞 socket 放线程里跑）。"""
+                """画面帧 → 浏览器。帧由 page_ws 的 pump 线程投进 frame_q，
+                这里只消费（ack + 转发），不再直接碰 socket —— 多线程抢读
+                同一条 socket 就是「画面能动、点击全死」的病根。"""
                 while not stop.is_set():
                     try:
-                        msg = await loop.run_in_executor(None, session.page_ws.recv_msg)
+                        p = await loop.run_in_executor(
+                            None, lambda: session.frame_q.get(True, 1.0))
+                    except queue.Empty:
+                        p = None
                     except Exception:
                         stop.set()
                         return
-                    if msg.get("method") == "Page.screencastFrame":
-                        p = msg.get("params", {})
-                        session.ack(p.get("sessionId", 0))
+                    if p is not None:
+                        await loop.run_in_executor(
+                            None, session.ack, p.get("sessionId", 0))
                         try:
                             await ws.send_json({"type": "frame", "data": p.get("data", "")})
                         except Exception:
