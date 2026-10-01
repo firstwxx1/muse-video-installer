@@ -572,7 +572,13 @@ function start(){
   document.getElementById('start').disabled=true;
   say('正在启动登录窗口…');
   const q=urlTok?'token='+encodeURIComponent(urlTok):'key='+encodeURIComponent(key);
-  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?'+q);
+  // 支持挂在子路径下（域名反代 /import/* → 本服务）：ws 地址跟着当前页面的
+  // 路径前缀走 —— 直接开 IP:端口 时前缀是空，走域名时前缀是 /import。
+  // （故意不用正则：正则在 python 源码里会引入多余的转义字符）
+  let base=location.pathname;
+  if(base.charAt(base.length-1)!=='/'){ base=base.substring(0, base.lastIndexOf('/')+1); }
+  if(base.charAt(base.length-1)==='/'){ base=base.substring(0, base.length-1); }
+  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+base+'/ws?'+q);
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==='frame'){stage.style.display='block';view.src='data:image/jpeg;base64,'+m.data;}
