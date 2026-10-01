@@ -27,6 +27,10 @@
 
 本仓库 fork 自 [yys9253462-gif/muse-video-installer](https://github.com/yys9253462-gif/muse-video-installer)（原版 v1.1.1），迭代记录：
 
+**v1.4.1 · 修复：投屏窗口能看不能点**
+
+真机首测发现导号窗口画面正常但鼠标键盘全部无效。根因：CDP 通道多个线程抢读同一条 WebSocket，输入指令的响应被收帧线程吃掉、全部超时。修复为读写分离（单 pump 线程按 id 路由响应、事件进队列），并补上鼠标 `buttons` 状态位。
+
 **v1.4.0 · 终端一键导号（一条命令出链接，免 Key）**
 
 ```bash
