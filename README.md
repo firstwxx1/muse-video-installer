@@ -1,6 +1,6 @@
 # Muse 视频工作台 · 一键安装（firstwxx1 版）
 
-![Version](https://img.shields.io/badge/版本-v1.3.0-blue)
+![Version](https://img.shields.io/badge/版本-v1.4.0-blue)
 ![Fork](https://img.shields.io/badge/基于-yys9253462--gif%2Fmuse--video--installer-green)
 
 > 在**你自己的服务器**上，一条命令装好一个「输入文字就能生成视频」的网页工具。
@@ -27,18 +27,33 @@
 
 本仓库 fork 自 [yys9253462-gif/muse-video-installer](https://github.com/yys9253462-gif/muse-video-installer)（原版 v1.1.1），迭代记录：
 
+**v1.4.0 · 终端一键导号（一条命令出链接，免 Key）**
+
+```bash
+sudo bash /opt/mvw/install.sh --add-account
+```
+
+敲完这一条，终端会打印一个**一次性导号链接**——在自己电脑的浏览器里打开它，网页里直接出现登录窗口（不用填 Key、不用点按钮），登录 muse.ai 的瞬间 cookie 自动进账号池，终端这边同步显示「✓ 导入成功：你的邮箱」。
+
+| 特性 | 说明 |
+|---|---|
+| **免 Key** | 链接里带一次性令牌（15 分钟有效、导入成功即作废），不用再翻 API Key |
+| **自动开窗** | 带令牌的页面加载即自动启动登录窗口，零点击 |
+| **终端联动** | 服务器终端实时等待并显示导入结果；Ctrl-C 退出等待不影响链接有效性 |
+| **安全** | 令牌与网页分离存放（宿主机 `./runtime` 卷双向通道），用过即焚、过期自动清理 |
+
 **v1.3.0 · 一键导号（网页里登录，零本机依赖）**
 
 原版导入 muse.ai 账号要在你自己的电脑上装 Python、下载脚本、手填服务器地址和 Key、弹浏览器登录。现在整个流程搬进了一个网页：
 
-| 老流程（v1.1.x） | 新流程（v1.3.0） |
+| 老流程（v1.1.x） | 新流程（v1.3.0 起） |
 |---|---|
 | 本机装 Python | 不用装任何东西 |
 | 下载 `get_muse_cookie.py` | 不用下载 |
-| 手填服务器地址 + API Key | 只需粘贴一次 Key |
+| 手填服务器地址 + API Key | v1.3.0 粘贴一次 Key；v1.4.0 起连 Key 都不用 |
 | 本机弹浏览器登录 | 登录窗口就在网页里（服务器无头 Chromium 实时投屏） |
 
-用法：装完打开 `http://你的服务器IP:18620/`（导号专用端口），粘贴 Key → 打开登录窗口 → 在里面登录 muse.ai → 看到「导入成功」。加第二个账号点「再导一个」。cookie 抓取和入库全部在服务器上自动完成。
+用法：`sudo bash install.sh --add-account` 拿链接（v1.4.0），或直接打开 `http://你的服务器IP:18620/` 粘贴 Key（v1.3.0 方式，仍然可用）。cookie 抓取和入库全部在服务器上自动完成。
 
 **v1.2.0 · 端口自动检测与自动切换**
 
@@ -178,17 +193,22 @@ API Key：       m2a_xxxxxxxxxxxxxxxxxxxx
 
 浏览器访问 `http://你的服务器IP:网页端口/`，右上角状态灯是绿的说明接口通了。
 
-### 第 2 步：导入 muse.ai 账号（必做）—— v1.3.0 起只需一个浏览器
+### 第 2 步：导入 muse.ai 账号（必做）—— v1.4.0 起一条命令
 
-打开 `http://你的服务器IP:18620/`（一键导号端口）：
+在服务器终端里敲：
 
-1. 粘贴 API Key，点「打开登录窗口」
-2. 网页里会出现一个实时登录窗口（跑在服务器上的无头浏览器，画面投屏过来）
-3. 在里面登录 muse.ai —— 看到「✓ 导入成功」就好了，cookie 自动进账号池
-4. 想加第二个账号，点「再导一个」
+```bash
+sudo bash /opt/mvw/install.sh --add-account
+```
 
-> 💡 老方法仍然可用：本机 Python 跑上游的 `tools/get_muse_cookie.py`。
-> 如果导号端口打不开，先查云安全组有没有放行它（默认 18620，被占过会自动换，以安装输出为准）。
+1. 终端打印一条一次性链接（15 分钟有效）—— 复制到你自己电脑的浏览器打开
+2. 网页里自动出现实时登录窗口（跑在服务器上的无头浏览器，画面投屏过来）
+3. 在里面登录 muse.ai —— cookie 自动进账号池，终端同步显示「✓ 导入成功：邮箱」
+4. 想加第二个账号，再敲一次这条命令拿新链接
+
+> 💡 其他方式仍然可用：直接开 `http://你的服务器IP:18620/` 手动粘贴 Key 导入（v1.3.0 方式）；
+> 或本机 Python 跑上游的 `tools/get_muse_cookie.py`（v1.1.x 老方式）。
+> 如果链接打不开，先查云安全组有没有放行导号端口（默认 18620，被占过会自动换，以安装输出为准）。
 
 ### 第 3 步：生成
 
@@ -208,6 +228,7 @@ Cherry Studio / NextChat 等支持 OpenAI 风格接口的软件都能连：
 | 我想… | 命令 |
 |---|---|
 | 看状态（找回地址和 Key） | `sudo bash install.sh --status` |
+| 添加 muse.ai 账号（一次性导号链接） | `sudo bash install.sh --add-account` |
 | 升级 | `sudo bash install.sh --upgrade` |
 | 卸载 | `sudo bash install.sh --uninstall` |
 | 看容器日志 | `cd /opt/mvw && docker compose -p mvw logs -f` |
@@ -240,7 +261,7 @@ Cherry Studio / NextChat 等支持 OpenAI 风格接口的软件都能连：
 - 程序本体：[yys9253462-gif/muse2api](https://github.com/yys9253462-gif/muse2api)
   —— 基于上游 [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api)（MIT 协议），
   叠加了 11 项稳定性与安全修复
-- 安装脚本版本：`1.3.0`
+- 安装脚本版本：`1.4.0`
 
 ### v1.3.0 一键导号的实现要点
 
