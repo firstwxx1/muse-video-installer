@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Muse 视频工作台 · 网页一键导号 sidecar（v1.4.1）
+"""Muse 视频工作台 · 网页一键导号 sidecar（v1.5.0）
 
 干什么用：
     原版导号要在用户自己的电脑上装 Python、跑脚本、手填服务器地址和 Key。
@@ -9,15 +9,22 @@
     鼠标键盘操作转发回去。用户在里面登录 muse.ai，session cookie 一出现就
     自动抓下来、自动注册进 muse2api 账号池。用户全程只需要一个浏览器。
 
-两条进入路径（v1.4.0）：
+两条进入路径：
     · ?key=<MUSE2API_KEY>    手动粘贴 Key（老方式，长期有效）
-    · ?token=<一次性令牌>     install.sh --add-account 在终端生成，15 分钟有效、
-                             导入成功即作废；页面拿到 token 会跳过填 Key 直接开窗，
-                             终端同时轮询 /api/token_status 显示导入结果
+    · ?token=<导号令牌>       install.sh --add-account 在终端生成，15 分钟有效；
+                             页面拿到 token 跳过填 Key 直接开窗，终端同时轮询
+                             /api/token_status?since=N 显示每一个导入结果
+
+多账号（v1.5.0）：
+    · 一条令牌 = 一个 15 分钟的「导号窗口」，期间可以连着导多个账号 ——
+      网页里导完一个点「再导一个」即可，终端会依次报出每个账号。
+    · 每次成功导入自动把这个窗口续期 15 分钟，连续导号不会中途失效。
+    · 同一个 muse.ai 账号重复导入不再堆重复条目：按邮箱匹配，命中就更新
+      那一份的 cookie（走 /admin/accounts/{id}/cookies），池子里一个账号只占一行。
 
 安全模型：
     · 网页本身不含任何密钥（连 HTML 都是公开无害的）
-    · WebSocket 连接必须带有效 key 或未使用且未过期的 token
+    · WebSocket 连接必须带有效 key 或有效令牌；同一令牌同时只允许一个窗口
     · 令牌文件在宿主机 ./runtime 卷上，两边都「读-改-原子替换」
     · cookie 只经本机回环进账号池，不落地、不外发
 
@@ -65,6 +72,7 @@ DOMAIN_HINT = "muse.ai"
 SESSION_COOKIE = "hatch_sess"     # 登录成功后必然出现的会话 cookie
 VIEW_W, VIEW_H = 1280, 800
 IDLE_TIMEOUT = 600                # 无操作 10 分钟自动回收浏览器
+TOKEN_TTL = 900                   # 导号令牌窗口时长（每次成功导入自动续期）
 
 # ── 极简 WebSocket 客户端（RFC6455 文本帧，stdlib，供 CDP 用）────────
 #    与上游 tools/get_muse_cookie.py 里的 WS 同族：容器里没有 websocket-client，
@@ -372,6 +380,21 @@ def _api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
         return json.loads(body) if body.strip() else {}
 
 
+def list_accounts() -> list[dict]:
+    """账号池里的账号列表（按 label 判重用）。拿不到就返回空表。"""
+    try:
+        r = _api("/admin/accounts")
+    except Exception:
+        return []
+    if isinstance(r, list):
+        return r
+    for k in ("accounts", "items", "data", "list"):
+        v = r.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
 def pool_count() -> int:
     try:
         r = _api("/admin/accounts")
@@ -387,19 +410,46 @@ def pool_count() -> int:
 
 
 def import_account(label: str, cookies: dict[str, dict]) -> dict:
-    return _api("/admin/accounts", "POST", {
+    """把一次登录抓到的 cookie 写进账号池。
+
+    v1.5.0：先按邮箱找同款账号 —— 命中就更新它那份 cookie（走
+    /admin/accounts/{id}/cookies，该端点会重置有效期锚点），不新增条目。
+    只有真正的新账号才追加。返回结果带 updated 标志。
+    """
+    payload_cookies = {k: v["value"] for k, v in cookies.items()}
+    payload_expires = {k: v["expires"] for k, v in cookies.items() if v["expires"] > 0}
+
+    key = (label or "").strip().lower()
+    existing = None
+    if key:
+        for a in list_accounts():
+            if (a.get("label") or "").strip().lower() == key:
+                existing = a
+                break
+
+    if existing:
+        r = _api(f"/admin/accounts/{existing['id']}/cookies", "POST", {
+            "cookies": payload_cookies, "expires": payload_expires})
+        r = dict(r) if isinstance(r, dict) else {}
+        r["updated"] = True
+        r["id"] = existing["id"]
+        return r
+
+    r = _api("/admin/accounts", "POST", {
         "label": label,
-        "cookies": {k: v["value"] for k, v in cookies.items()},
-        "expires": {k: v["expires"] for k, v in cookies.items() if v["expires"] > 0},
+        "cookies": payload_cookies,
+        "expires": payload_expires,
     })
+    r = dict(r) if isinstance(r, dict) else {}
+    r["updated"] = False
+    return r
 
 
-# ── 一次性导号令牌（install.sh --add-account 在宿主机生成）────────────
+# ── 导号令牌（install.sh --add-account 在宿主机生成）──────────────────
 #    文件经 ./runtime 卷共享。宿主机只「加新令牌+清理过期」，本进程只
-#    「回写 used 标记」——两边都是读-改-原子替换，竞争窗口的最坏结果
-#    只是丢一次 used 标记（令牌多活几分钟），不会丢令牌本身。
+#    「回写导入计数」——两边都是读-改-原子替换，竞争窗口的最坏结果只是
+#    丢一次计数（终端少报一次），不会丢令牌本身。
 _active_tokens: set[str] = set()      # 正被某条 ws 占用的令牌
-_token_results: dict[str, str] = {}   # 本进程内已完成：令牌 → 邮箱（重启后靠文件里的记录兜底）
 
 
 def _load_tokens() -> dict:
@@ -428,10 +478,11 @@ def _save_tokens(tokens: dict) -> None:
 
 
 def token_valid(token: str) -> bool:
+    """令牌只在它的时间窗口内有效（不因用过一次而废）。"""
     if not token:
         return False
     m = _load_tokens().get(token)
-    if not m or m.get("used"):
+    if not isinstance(m, dict):
         return False
     try:
         return float(m.get("expires", 0)) > time.time()
@@ -439,13 +490,24 @@ def token_valid(token: str) -> bool:
         return False
 
 
-def mark_token_used(token: str, email: str) -> None:
+def record_import(token: str, email: str) -> None:
+    """记一次成功导入：计数 +1、记住邮箱，并把窗口再续 15 分钟。
+
+    v1.5.0 起令牌不再「用一次就废」—— 一个窗口里可以连着导多个账号
+    （网页上点「再导一个」），连续导入也不会中途过期。
+    """
     tokens = _load_tokens()
-    if token in tokens:
-        tokens[token]["used"] = True
-        tokens[token]["email"] = email
-        _save_tokens(tokens)
-    _token_results[token] = email
+    m = tokens.get(token)
+    if not isinstance(m, dict):
+        return
+    try:
+        m["imports"] = int(m.get("imports", 0) or 0) + 1
+    except (TypeError, ValueError):
+        m["imports"] = 1
+    m["email"] = email
+    m["expires"] = time.time() + TOKEN_TTL
+    tokens[token] = m
+    _save_tokens(tokens)
 
 
 # ── 网页（无任何密钥，key 由用户输入后仅存 sessionStorage）────────────
@@ -492,11 +554,13 @@ PAGE = """<!DOCTYPE html>
 const stage=document.getElementById('stage'),view=document.getElementById('view'),
       statusEl=document.getElementById('status'),keyEl=document.getElementById('key');
 // v1.4.0：终端 --add-account 生成的链接带 ?token=，跳过填 Key 直接开窗
+// v1.5.0：令牌有效期内可以连着导多个账号（导完点「再导一个」）
 const urlTok=new URLSearchParams(location.search).get('token')||'';
 if(urlTok){
   document.getElementById('keyrow').style.display='none';
-  document.getElementById('hints').innerHTML='这是终端生成的一次性导号链接（已自动验证，15 分钟内有效）。'+
-    '<br>登录窗口正在打开 —— 在里面登录 muse.ai，看到「导入成功」就好了。';
+  document.getElementById('hints').innerHTML='这是终端生成的导号窗口（15 分钟内有效，可以连着导多个账号）。'+
+    '<br>登录窗口正在打开 —— 在里面登录 muse.ai，看到「导入成功」就好了。'+
+    '<br>想导下一个账号，点「再导一个账号」，再登录另一个 muse.ai 账号。';
 }
 keyEl.value=sessionStorage.getItem('mvw_key')||'';
 let ws=null,again=false;
@@ -514,9 +578,12 @@ function start(){
     if(m.type==='frame'){stage.style.display='block';view.src='data:image/jpeg;base64,'+m.data;}
     else if(m.type==='info'){say(m.text);}
     else if(m.type==='done'){
-      say('✓ 导入成功：'+m.label+(m.count>=0?'（账号池现有 '+m.count+' 个）':''),'ok');
+      say((m.updated?'✓ 这个账号之前导过，已刷新它的会话：':'✓ 导入成功：')+m.label+
+          (m.count>=0?'（账号池现有 '+m.count+' 个）':''),'ok');
       const b=document.createElement('button');b.textContent='再导一个账号';
-      b.style.marginLeft='10px';b.onclick=()=>{b.remove();say('正在重置窗口…');ws.send(JSON.stringify({kind:'again'}));};
+      b.style.marginLeft='10px';
+      b.onclick=()=>{b.remove();say('正在重置窗口，换个 muse.ai 账号登录…');
+        ws.send(JSON.stringify({kind:'again'}));};
       statusEl.appendChild(b);
     }
     else if(m.type==='error'){say('× '+m.text,'err');document.getElementById('start').disabled=false;}
@@ -562,26 +629,35 @@ async def healthz():
 
 
 @app.get("/api/token_status")
-async def token_status(token: str = ""):
+async def token_status(token: str = "", since: int = 0):
     """终端 install.sh --add-account 的轮询端点（只经回环调用）。
 
-    状态机：pending（已生成没人开）→ active（浏览器已连上）
-            → done（导入成功，带 email）；expired / unknown 为终态异常。
+    since = 终端已经报过的导入次数（第一次问传 0）。
+    返回的 state：
+      pending   链接已生成，还没人打开
+      active    浏览器窗口正开着，用户正在里面操作
+      done      本次窗口又导进来了一个（imports > since），带 email / imports / count
+      expired   窗口超时（15 分钟无人操作）
+      unknown   令牌不存在
     """
     if not token:
         return {"state": "unknown"}
-    if token in _token_results:
-        return {"state": "done", "email": _token_results[token]}
     m = _load_tokens().get(token)
-    if not m:
+    if not isinstance(m, dict):
         return {"state": "unknown"}
-    if m.get("used"):
-        return {"state": "done", "email": m.get("email", "")}
     try:
-        if float(m.get("expires", 0)) <= time.time():
-            return {"state": "expired"}
+        expires = float(m.get("expires", 0))
     except (TypeError, ValueError):
         return {"state": "unknown"}
+    try:
+        imports = int(m.get("imports", 0) or 0)
+    except (TypeError, ValueError):
+        imports = 0
+    if imports > since:
+        return {"state": "done", "email": m.get("email", ""),
+                "imports": imports, "count": pool_count()}
+    if expires <= time.time():
+        return {"state": "expired"}
     if token in _active_tokens:
         return {"state": "active"}
     return {"state": "pending"}
@@ -630,6 +706,10 @@ async def ws_endpoint(ws: WebSocket):
 
             stop = asyncio.Event()
             last_active = time.time()
+            # 本窗口已经导过的邮箱 —— cookie_watch 每 2 秒轮一次，没有这个集合
+            # 就会对着同一个已登录账号反复导入（v1.5.0 修）。点「再导一个」
+            # 会换干净 profile 并清空它。
+            imported_labels: set[str] = set()
 
             async def frames_out():
                 """画面帧 → 浏览器。帧由 page_ws 的 pump 线程投进 frame_q，
@@ -678,6 +758,7 @@ async def ws_endpoint(ws: WebSocket):
                         if kind == "again":
                             # 重置：换干净 profile 重启，继续同一条 ws
                             await loop.run_in_executor(None, _reset_browser, session)
+                            imported_labels.clear()
                         elif kind == "key":
                             await loop.run_in_executor(None, session.dispatch_key, ev)
                         else:
@@ -697,13 +778,18 @@ async def ws_endpoint(ws: WebSocket):
                         if not email:
                             continue  # 登录中转态，等页面稳定
                         label = email
-                        await loop.run_in_executor(None, import_account, label, cookies)
+                        if label.strip().lower() in imported_labels:
+                            continue  # 这个账号本窗口已经导过了
+                        res = await loop.run_in_executor(
+                            None, import_account, label, cookies)
+                        imported_labels.add(label.strip().lower())
                         if via_token:
-                            # 导入成功 = 令牌使命完成，即刻作废；
-                            # 终端的 --add-account 轮询 /api/token_status 会拿到结果
-                            await loop.run_in_executor(None, mark_token_used, token, label)
+                            # 一次成功导入 = 一次进度；终端的
+                            # /api/token_status?since=N 轮询会依次拿到每个结果
+                            await loop.run_in_executor(None, record_import, token, label)
                         await ws.send_json({
-                            "type": "done", "label": label, "count": pool_count()})
+                            "type": "done", "label": label, "count": pool_count(),
+                            "updated": bool(isinstance(res, dict) and res.get("updated"))})
                     except WebSocketDisconnect:
                         stop.set()
                         return
