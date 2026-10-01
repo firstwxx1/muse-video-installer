@@ -58,7 +58,7 @@ if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
   fi
 fi
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.5.0"
 # 前缀统一用 mvw-（Muse Video Workbench），避免和用户已有的 muse-video / muse2api
 # 等同名服务撞车 —— 曾因默认名与既有服务的 unit 重名，把别人的服务覆盖掉。
 APP_NAME="mvw"
@@ -118,7 +118,12 @@ DO_STATUS=0
 DO_UNINSTALL=0
 DO_UPGRADE=0
 DO_ADD_ACCOUNT=0
+DO_ACCOUNTS=0
+DO_LINK=0
 DO_HELP=0
+# --accounts 的附属动作（列表是默认行为）
+ACCT_REMOVE=""
+ACCT_TEST=0
 INSTALL_DIR="${INSTALL_DIR_SELF:-$DEFAULT_DIR}"
 API_PORT=""
 WEB_PORT=""
@@ -137,14 +142,22 @@ ${APP_LABEL} 一键安装脚本 v${SCRIPT_VERSION}
 
 用法：sudo bash ${SELF} [选项]
 
-常用：
-  --yes, -y            全自动安装，所有问题用默认值（适合脚本/CI）
-  --dry-run            只显示会做什么，不实际改动系统
+最常用（就这么用）：
+  sudo bash ${SELF}              装好后直接敲 muse 进控制面板
+  muse                           终端面板：加账号 / 看状态 / 管账号池 / 拿直达链接
+  --add-account        导号：生成登录链接，浏览器打开登录即导入（可连续导多个）
+  --link               打印工作台直达链接（带 Key，点开即用）
+  --accounts           账号池管理（列出 / 删除 / 测活）
+
+其他：
   --status             看当前运行状态（也能找回地址和 API Key）
-  --add-account        生成一次性导号链接（浏览器打开登录即导入账号）
   --upgrade            升级到最新版
   --uninstall          卸载
   --help, -h           显示本帮助
+
+自动化：
+  --yes, -y            全自动安装，所有问题用默认值（适合脚本/CI）
+  --dry-run            只显示会做什么，不实际改动系统
 
 进阶：
   --dir <路径>         安装到哪个目录（默认 ${DEFAULT_DIR}）
@@ -154,11 +167,15 @@ ${APP_LABEL} 一键安装脚本 v${SCRIPT_VERSION}
   --domain <域名>      给网页绑个域名并自动配 HTTPS（需要域名已解析到本机）
   --no-domain          不要域名（默认就是不要）
   --no-deps            不自动安装依赖，缺什么只告诉你
+  --accounts --remove <编号|ID>   删掉账号池里的某个账号
+  --accounts --test               逐个验证账号会话是否还有效（会真开浏览器，慢）
 
 示例：
   sudo bash ${SELF}
   sudo bash ${SELF} --yes --web-port 8090
   sudo bash ${SELF} --domain video.example.com
+  sudo bash ${SELF} --add-account
+  sudo bash ${SELF} --accounts
 EOF
 }
 
@@ -237,6 +254,11 @@ while [ $# -gt 0 ]; do
     --no-deps)       NO_DEPS=1 ;;
     --status)        DO_STATUS=1 ;;
     --add-account)   DO_ADD_ACCOUNT=1 ;;
+    --accounts)      DO_ACCOUNTS=1 ;;
+    --link|--open)   DO_LINK=1 ;;
+    --remove)        ACCT_REMOVE="${2:-}"; shift; [ -n "${ACCT_REMOVE:-}" ] || die "--remove 后面要跟账号编号或 ID（先跑 --accounts 看列表）" ;;
+    --remove=*)      ACCT_REMOVE="${1#*=}"; [ -n "$ACCT_REMOVE" ] || die "--remove= 后面要跟账号编号或 ID" ;;
+    --test)          ACCT_TEST=1 ;;
     --uninstall)     DO_UNINSTALL=1 ;;
     --upgrade)       DO_UPGRADE=1 ;;
     --help|-h)       DO_HELP=1 ;;
@@ -291,12 +313,15 @@ for _pair in "$API_PORT $IMPORT_PORT 接口 导号" "$WEB_PORT $IMPORT_PORT 网�
 done
 unset _pair
 
-# 子命令互斥检查：--status / --uninstall / --upgrade / --add-account 只能给一个
+# 子命令互斥检查：--status / --uninstall / --upgrade / --add-account /
+#                  --accounts / --link 只能给一个
+# --remove / --test 是 --accounts 的附属动作，给了它们就等于要管账号池
+if [ -n "$ACCT_REMOVE" ] || [ "$ACCT_TEST" = 1 ]; then DO_ACCOUNTS=1; fi
 _SUB_CNT=0
 _SUB_LIST=""
 # ⚠️ 循环里用下划线写法（add_account），因为 eval 拼变量名时连字符是非法字符；
 #    展示给用户时再转回连字符。
-for _v in status uninstall upgrade add_account; do
+for _v in status uninstall upgrade add_account accounts link; do
   eval "_cur=\$DO_$(printf '%s' "$_v" | tr 'a-z' 'A-Z')"
   if [ "$_cur" = 1 ]; then
     _SUB_CNT=$((_SUB_CNT + 1))
@@ -966,7 +991,7 @@ write_importer() {
   cat > "$dir/import_sidecar.py" <<'MUSEIMPORT'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Muse 视频工作台 · 网页一键导号 sidecar（v1.4.1）
+"""Muse 视频工作台 · 网页一键导号 sidecar（v1.5.0）
 
 干什么用：
     原版导号要在用户自己的电脑上装 Python、跑脚本、手填服务器地址和 Key。
@@ -975,15 +1000,22 @@ write_importer() {
     鼠标键盘操作转发回去。用户在里面登录 muse.ai，session cookie 一出现就
     自动抓下来、自动注册进 muse2api 账号池。用户全程只需要一个浏览器。
 
-两条进入路径（v1.4.0）：
+两条进入路径：
     · ?key=<MUSE2API_KEY>    手动粘贴 Key（老方式，长期有效）
-    · ?token=<一次性令牌>     install.sh --add-account 在终端生成，15 分钟有效、
-                             导入成功即作废；页面拿到 token 会跳过填 Key 直接开窗，
-                             终端同时轮询 /api/token_status 显示导入结果
+    · ?token=<导号令牌>       install.sh --add-account 在终端生成，15 分钟有效；
+                             页面拿到 token 跳过填 Key 直接开窗，终端同时轮询
+                             /api/token_status?since=N 显示每一个导入结果
+
+多账号（v1.5.0）：
+    · 一条令牌 = 一个 15 分钟的「导号窗口」，期间可以连着导多个账号 ——
+      网页里导完一个点「再导一个」即可，终端会依次报出每个账号。
+    · 每次成功导入自动把这个窗口续期 15 分钟，连续导号不会中途失效。
+    · 同一个 muse.ai 账号重复导入不再堆重复条目：按邮箱匹配，命中就更新
+      那一份的 cookie（走 /admin/accounts/{id}/cookies），池子里一个账号只占一行。
 
 安全模型：
     · 网页本身不含任何密钥（连 HTML 都是公开无害的）
-    · WebSocket 连接必须带有效 key 或未使用且未过期的 token
+    · WebSocket 连接必须带有效 key 或有效令牌；同一令牌同时只允许一个窗口
     · 令牌文件在宿主机 ./runtime 卷上，两边都「读-改-原子替换」
     · cookie 只经本机回环进账号池，不落地、不外发
 
@@ -1031,6 +1063,7 @@ DOMAIN_HINT = "muse.ai"
 SESSION_COOKIE = "hatch_sess"     # 登录成功后必然出现的会话 cookie
 VIEW_W, VIEW_H = 1280, 800
 IDLE_TIMEOUT = 600                # 无操作 10 分钟自动回收浏览器
+TOKEN_TTL = 900                   # 导号令牌窗口时长（每次成功导入自动续期）
 
 # ── 极简 WebSocket 客户端（RFC6455 文本帧，stdlib，供 CDP 用）────────
 #    与上游 tools/get_muse_cookie.py 里的 WS 同族：容器里没有 websocket-client，
@@ -1338,6 +1371,21 @@ def _api(path: str, method: str = "GET", payload: dict | None = None) -> dict:
         return json.loads(body) if body.strip() else {}
 
 
+def list_accounts() -> list[dict]:
+    """账号池里的账号列表（按 label 判重用）。拿不到就返回空表。"""
+    try:
+        r = _api("/admin/accounts")
+    except Exception:
+        return []
+    if isinstance(r, list):
+        return r
+    for k in ("accounts", "items", "data", "list"):
+        v = r.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
 def pool_count() -> int:
     try:
         r = _api("/admin/accounts")
@@ -1353,19 +1401,46 @@ def pool_count() -> int:
 
 
 def import_account(label: str, cookies: dict[str, dict]) -> dict:
-    return _api("/admin/accounts", "POST", {
+    """把一次登录抓到的 cookie 写进账号池。
+
+    v1.5.0：先按邮箱找同款账号 —— 命中就更新它那份 cookie（走
+    /admin/accounts/{id}/cookies，该端点会重置有效期锚点），不新增条目。
+    只有真正的新账号才追加。返回结果带 updated 标志。
+    """
+    payload_cookies = {k: v["value"] for k, v in cookies.items()}
+    payload_expires = {k: v["expires"] for k, v in cookies.items() if v["expires"] > 0}
+
+    key = (label or "").strip().lower()
+    existing = None
+    if key:
+        for a in list_accounts():
+            if (a.get("label") or "").strip().lower() == key:
+                existing = a
+                break
+
+    if existing:
+        r = _api(f"/admin/accounts/{existing['id']}/cookies", "POST", {
+            "cookies": payload_cookies, "expires": payload_expires})
+        r = dict(r) if isinstance(r, dict) else {}
+        r["updated"] = True
+        r["id"] = existing["id"]
+        return r
+
+    r = _api("/admin/accounts", "POST", {
         "label": label,
-        "cookies": {k: v["value"] for k, v in cookies.items()},
-        "expires": {k: v["expires"] for k, v in cookies.items() if v["expires"] > 0},
+        "cookies": payload_cookies,
+        "expires": payload_expires,
     })
+    r = dict(r) if isinstance(r, dict) else {}
+    r["updated"] = False
+    return r
 
 
-# ── 一次性导号令牌（install.sh --add-account 在宿主机生成）────────────
+# ── 导号令牌（install.sh --add-account 在宿主机生成）──────────────────
 #    文件经 ./runtime 卷共享。宿主机只「加新令牌+清理过期」，本进程只
-#    「回写 used 标记」——两边都是读-改-原子替换，竞争窗口的最坏结果
-#    只是丢一次 used 标记（令牌多活几分钟），不会丢令牌本身。
+#    「回写导入计数」——两边都是读-改-原子替换，竞争窗口的最坏结果只是
+#    丢一次计数（终端少报一次），不会丢令牌本身。
 _active_tokens: set[str] = set()      # 正被某条 ws 占用的令牌
-_token_results: dict[str, str] = {}   # 本进程内已完成：令牌 → 邮箱（重启后靠文件里的记录兜底）
 
 
 def _load_tokens() -> dict:
@@ -1394,10 +1469,11 @@ def _save_tokens(tokens: dict) -> None:
 
 
 def token_valid(token: str) -> bool:
+    """令牌只在它的时间窗口内有效（不因用过一次而废）。"""
     if not token:
         return False
     m = _load_tokens().get(token)
-    if not m or m.get("used"):
+    if not isinstance(m, dict):
         return False
     try:
         return float(m.get("expires", 0)) > time.time()
@@ -1405,13 +1481,24 @@ def token_valid(token: str) -> bool:
         return False
 
 
-def mark_token_used(token: str, email: str) -> None:
+def record_import(token: str, email: str) -> None:
+    """记一次成功导入：计数 +1、记住邮箱，并把窗口再续 15 分钟。
+
+    v1.5.0 起令牌不再「用一次就废」—— 一个窗口里可以连着导多个账号
+    （网页上点「再导一个」），连续导入也不会中途过期。
+    """
     tokens = _load_tokens()
-    if token in tokens:
-        tokens[token]["used"] = True
-        tokens[token]["email"] = email
-        _save_tokens(tokens)
-    _token_results[token] = email
+    m = tokens.get(token)
+    if not isinstance(m, dict):
+        return
+    try:
+        m["imports"] = int(m.get("imports", 0) or 0) + 1
+    except (TypeError, ValueError):
+        m["imports"] = 1
+    m["email"] = email
+    m["expires"] = time.time() + TOKEN_TTL
+    tokens[token] = m
+    _save_tokens(tokens)
 
 
 # ── 网页（无任何密钥，key 由用户输入后仅存 sessionStorage）────────────
@@ -1458,11 +1545,13 @@ PAGE = """<!DOCTYPE html>
 const stage=document.getElementById('stage'),view=document.getElementById('view'),
       statusEl=document.getElementById('status'),keyEl=document.getElementById('key');
 // v1.4.0：终端 --add-account 生成的链接带 ?token=，跳过填 Key 直接开窗
+// v1.5.0：令牌有效期内可以连着导多个账号（导完点「再导一个」）
 const urlTok=new URLSearchParams(location.search).get('token')||'';
 if(urlTok){
   document.getElementById('keyrow').style.display='none';
-  document.getElementById('hints').innerHTML='这是终端生成的一次性导号链接（已自动验证，15 分钟内有效）。'+
-    '<br>登录窗口正在打开 —— 在里面登录 muse.ai，看到「导入成功」就好了。';
+  document.getElementById('hints').innerHTML='这是终端生成的导号窗口（15 分钟内有效，可以连着导多个账号）。'+
+    '<br>登录窗口正在打开 —— 在里面登录 muse.ai，看到「导入成功」就好了。'+
+    '<br>想导下一个账号，点「再导一个账号」，再登录另一个 muse.ai 账号。';
 }
 keyEl.value=sessionStorage.getItem('mvw_key')||'';
 let ws=null,again=false;
@@ -1480,9 +1569,12 @@ function start(){
     if(m.type==='frame'){stage.style.display='block';view.src='data:image/jpeg;base64,'+m.data;}
     else if(m.type==='info'){say(m.text);}
     else if(m.type==='done'){
-      say('✓ 导入成功：'+m.label+(m.count>=0?'（账号池现有 '+m.count+' 个）':''),'ok');
+      say((m.updated?'✓ 这个账号之前导过，已刷新它的会话：':'✓ 导入成功：')+m.label+
+          (m.count>=0?'（账号池现有 '+m.count+' 个）':''),'ok');
       const b=document.createElement('button');b.textContent='再导一个账号';
-      b.style.marginLeft='10px';b.onclick=()=>{b.remove();say('正在重置窗口…');ws.send(JSON.stringify({kind:'again'}));};
+      b.style.marginLeft='10px';
+      b.onclick=()=>{b.remove();say('正在重置窗口，换个 muse.ai 账号登录…');
+        ws.send(JSON.stringify({kind:'again'}));};
       statusEl.appendChild(b);
     }
     else if(m.type==='error'){say('× '+m.text,'err');document.getElementById('start').disabled=false;}
@@ -1528,26 +1620,35 @@ async def healthz():
 
 
 @app.get("/api/token_status")
-async def token_status(token: str = ""):
+async def token_status(token: str = "", since: int = 0):
     """终端 install.sh --add-account 的轮询端点（只经回环调用）。
 
-    状态机：pending（已生成没人开）→ active（浏览器已连上）
-            → done（导入成功，带 email）；expired / unknown 为终态异常。
+    since = 终端已经报过的导入次数（第一次问传 0）。
+    返回的 state：
+      pending   链接已生成，还没人打开
+      active    浏览器窗口正开着，用户正在里面操作
+      done      本次窗口又导进来了一个（imports > since），带 email / imports / count
+      expired   窗口超时（15 分钟无人操作）
+      unknown   令牌不存在
     """
     if not token:
         return {"state": "unknown"}
-    if token in _token_results:
-        return {"state": "done", "email": _token_results[token]}
     m = _load_tokens().get(token)
-    if not m:
+    if not isinstance(m, dict):
         return {"state": "unknown"}
-    if m.get("used"):
-        return {"state": "done", "email": m.get("email", "")}
     try:
-        if float(m.get("expires", 0)) <= time.time():
-            return {"state": "expired"}
+        expires = float(m.get("expires", 0))
     except (TypeError, ValueError):
         return {"state": "unknown"}
+    try:
+        imports = int(m.get("imports", 0) or 0)
+    except (TypeError, ValueError):
+        imports = 0
+    if imports > since:
+        return {"state": "done", "email": m.get("email", ""),
+                "imports": imports, "count": pool_count()}
+    if expires <= time.time():
+        return {"state": "expired"}
     if token in _active_tokens:
         return {"state": "active"}
     return {"state": "pending"}
@@ -1596,6 +1697,10 @@ async def ws_endpoint(ws: WebSocket):
 
             stop = asyncio.Event()
             last_active = time.time()
+            # 本窗口已经导过的邮箱 —— cookie_watch 每 2 秒轮一次，没有这个集合
+            # 就会对着同一个已登录账号反复导入（v1.5.0 修）。点「再导一个」
+            # 会换干净 profile 并清空它。
+            imported_labels: set[str] = set()
 
             async def frames_out():
                 """画面帧 → 浏览器。帧由 page_ws 的 pump 线程投进 frame_q，
@@ -1644,6 +1749,7 @@ async def ws_endpoint(ws: WebSocket):
                         if kind == "again":
                             # 重置：换干净 profile 重启，继续同一条 ws
                             await loop.run_in_executor(None, _reset_browser, session)
+                            imported_labels.clear()
                         elif kind == "key":
                             await loop.run_in_executor(None, session.dispatch_key, ev)
                         else:
@@ -1663,13 +1769,18 @@ async def ws_endpoint(ws: WebSocket):
                         if not email:
                             continue  # 登录中转态，等页面稳定
                         label = email
-                        await loop.run_in_executor(None, import_account, label, cookies)
+                        if label.strip().lower() in imported_labels:
+                            continue  # 这个账号本窗口已经导过了
+                        res = await loop.run_in_executor(
+                            None, import_account, label, cookies)
+                        imported_labels.add(label.strip().lower())
                         if via_token:
-                            # 导入成功 = 令牌使命完成，即刻作废；
-                            # 终端的 --add-account 轮询 /api/token_status 会拿到结果
-                            await loop.run_in_executor(None, mark_token_used, token, label)
+                            # 一次成功导入 = 一次进度；终端的
+                            # /api/token_status?since=N 轮询会依次拿到每个结果
+                            await loop.run_in_executor(None, record_import, token, label)
                         await ws.send_json({
-                            "type": "done", "label": label, "count": pool_count()})
+                            "type": "done", "label": label, "count": pool_count(),
+                            "updated": bool(isinstance(res, dict) and res.get("updated"))})
                     except WebSocketDisconnect:
                         stop.set()
                         return
@@ -2066,9 +2177,19 @@ write_webpage() {
 
   function loadCfg(){
     var c={}; try{ c=JSON.parse(localStorage.getItem(LS_CFG)||'{}'); }catch(e){}
-    state.base=c.base||location.origin.replace(/:\d+$/, ':18610');
-    state.key=c.key||'';
+    // 终端打印的直达链接会带 ?key=&api= —— 点开就自动填好，不用手抄 Key。
+    // 填好之后立刻从地址栏抹掉，免得 Key 留在浏览器历史和转发的链接里。
+    var q=null; try{ q=new URLSearchParams(location.search||''); }catch(e){}
+    var qk=(q&&q.get('key'))||'', qa=(q&&q.get('api'))||'';
+    var linked=!!(qk||qa);
+    state.base=normBase(qa||c.base||location.origin.replace(/:\d+$/, ':18610'));
+    state.key=(qk||c.key||'').trim();
     $('baseUrl').value=state.base; $('apiKey').value=state.key;
+    if(linked){
+      try{ localStorage.setItem(LS_CFG, JSON.stringify({base:state.base,key:state.key})); }catch(e){}
+      try{ history.replaceState(null,'',location.pathname); }catch(e){}
+      toast('已自动填好接口地址和 API Key');
+    }
     if(state.key) testConn(true);
   }
   function saveCfg(){
@@ -2380,15 +2501,20 @@ print_next_steps() {
   say "  ${C_BLD}② 导入 muse.ai 账号（必须先做这步，否则生成不了）${C_OFF}"
   say "     在终端里敲这一条："
   say "        ${C_BLD}sudo $(self_hint) --add-account${C_OFF}"
-  say "     它会给你一条一次性链接 —— 在你自己电脑的浏览器里打开，"
+  say "     它会给你一条链接 —— 在你自己电脑的浏览器里打开，"
   say "     网页里出现登录窗口，登录 muse.ai 就导入完成了。"
-  say "     ${C_BLD}不用装 Python、不用下载工具、不用填 Key${C_OFF} —— 想加几个号就敲几次。"
+  say "     ${C_BLD}不用装 Python、不用下载工具、不用填 Key${C_OFF}。"
+  say "     一条链接能连着导多个账号（导完一个，在网页上点「再导一个」）。"
   say ""
   say "     ${C_DIM}（也可以直接开 http://${IP}:${IMPORT_PORT}/ 手动粘贴 Key 导入；"
   say "     老方法 tools/get_muse_cookie.py 同样仍然可用）${C_OFF}"
   say ""
   say "  ${C_BLD}③ 回到网页，输入一句话测试${C_OFF}"
-  say "     接口地址和 Key 已经自动填好了，直接写描述、点生成就行。"
+  say "     用这条直达链接打开，接口地址和 Key 会自动填好："
+  say "        ${C_BLD}$(direct_link "$API_KEY" "$IP")${C_OFF}"
+  say "     然后直接写描述、点生成就行。"
+  say ""
+  say "  ${C_DIM}以后要加账号、看账号池、再拿这条链接，直接在终端敲：${C_OFF}${C_BLD} muse${C_OFF}"
   say ""
   printf '%s  ────────── 以下是详细信息，以后需要再查 ──────────%s\n\n' "$C_DIM" "$C_OFF"
   say "  网页地址：      http://${IP}:${WEB_PORT}/"
@@ -2409,22 +2535,25 @@ print_next_steps() {
   say "  常用命令："
   # 用 self_hint：脚本自己已经存了一份到安装目录，这里给出**一定可用**的命令。
   # （管道安装时用户手上没有脚本文件，写 ${SELF} 他会找不到。）
+  say "    ${C_BLD}muse${C_OFF}                            终端控制面板（加账号 / 管账号池 / 拿链接）"
+  say "    sudo $(self_hint) --add-account 导号：生成登录链接（可连着导多个账号）"
+  say "    sudo $(self_hint) --link        工作台直达链接（带 Key，点开即用）"
+  say "    sudo $(self_hint) --accounts    账号池管理（列出 / 删除 / 测活）"
   say "    sudo $(self_hint) --status      看运行状态（也能把上面的地址和 Key 再打印一遍）"
-  say "    sudo $(self_hint) --add-account 生成一次性导号链接（加 muse.ai 账号用）"
   say "    sudo $(self_hint) --upgrade     升级到最新版"
   say "    sudo $(self_hint) --uninstall   卸载"
   if [ -n "$SELF_PATH" ] && [ "$SELF_PATH" != "$INSTALL_DIR/install.sh" ]; then
     say "    ${C_DIM}（脚本已另存一份到 $INSTALL_DIR/install.sh，你原来的那份可以删）${C_OFF}"
   fi
   say ""
-  say "  ${C_DIM}记不住 API Key？随时跑 --status 就能看回来。${C_OFF}"
+  say "  ${C_DIM}记不住 API Key？随时跑 --status 就能看回来；或者敲 muse 进面板拿直达链接。${C_OFF}"
   say ""
   warn "如果网页打不开，多半是云服务商的安全组没放行 ${WEB_PORT}、${API_PORT}、${IMPORT_PORT} 端口，去控制台加一下。"
   say ""
   dim "  验收清单："
   dim "    □ 网页 http://${IP}:${WEB_PORT}/ 能打开（左侧能看到「生成视频」按钮）"
   dim "    □ 右上角状态灯是绿的（说明 Key 对、接口通）"
-  dim "    □ 账号池里有 1 个账号（http://${IP}:${API_PORT}/admin?key=${API_KEY}）"
+  dim "    □ 账号池里有 1 个账号（终端敲 sudo $(self_hint) --accounts 看）"
   dim "      ↑ 现在还是 0 个，做完上面第 ② 步（导号）才会变成 1"
   dim "    □ 填一句描述点生成，1-2 分钟内出片"
   say ""
@@ -2562,6 +2691,9 @@ do_install() {
   run mkdir -p "$INSTALL_DIR/runtime"
   # 一次输出一整句，别拆成两条 —— 拆开会和 pick_port 的告警交错成乱码
   ok "配置完成：接口端口 $API_PORT，网页端口 $WEB_PORT"
+
+  # 终端面板快捷命令：/usr/local/bin/muse（之后敲 muse 就能回到控制面板）
+  install_cli
 
   # ── 域名（默认不要） ──
   if [ -z "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ] && [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
@@ -2832,22 +2964,28 @@ do_status() {
     warn "读不到 API Key（可能装的是旧版本）。可从 $INSTALL_DIR/docker-compose.yml 里找 MUSE2API_KEY"
   fi
 
+  # 账号数：直接数 /admin/accounts 里的数组长度
+  # （⚠️ 早期版本在这里 grep '"total"'，而接口返回里根本没有这个字段 ——
+  #   于是 --status 从来不显示账号数，空池指引也从来不触发。v1.5.0 修。）
   local acct
-  acct="$(curl -s --max-time 8 "http://127.0.0.1:${API_PORT}/admin/accounts" \
-    -H "Authorization: Bearer ${k}" 2>/dev/null \
-    | grep -o '"total":[0-9]*' | head -1)"
-  [ -n "$acct" ] && say "    账号池：     ${acct#*:} 个账号"
-  if [ -n "$acct" ] && [ "${acct#*:}" = "0" ]; then
+  acct="$(pool_summary "$k")"
+  [ -n "$acct" ] && say "    账号池：     ${acct} 个账号"
+  if [ -n "$k" ]; then
+    say ""
+    say "  ${C_BLD}工作台直达链接${C_OFF}（点开即用 —— 接口地址和 Key 都会自动填好）"
+    say "    $(direct_link "$k" "$ip")"
+  fi
+  if [ "${acct:-}" = "0" ]; then
     say ""
     warn "账号池是空的 —— 还没导入 muse.ai 账号，现在生成不了视频。"
     say ""
     say "    ${C_BLD}加账号只要一条命令：${C_OFF}"
     say "      sudo $(self_hint) --add-account"
-    say "      它会生成一条一次性链接，在你自己电脑的浏览器里打开、"
+    say "      它会生成一条链接 —— 在你自己电脑的浏览器里打开、"
     say "      登录 muse.ai 就导入完成了（不用装 Python、不用填 Key）。"
     say ""
-    say "     ${C_DIM}想加多个账号？每加一个就跑一次这条命令。"
-    say "     导入完再跑一次 --status 就能看到账号数变成 1（或更多）。${C_OFF}"
+    say "     ${C_DIM}一条链接就能连着导多个账号（导完一个在网页点「再导一个」）。"
+    say "     管理账号池：sudo $(self_hint) --accounts${C_OFF}"
   fi
   say ""
   say "  最近的日志："
@@ -2859,6 +2997,81 @@ do_status() {
 # v1.4.0：终端里一条命令完成导号 —— 生成一次性令牌 → 打印免 Key 链接 →
 # 用户在浏览器打开链接登录 muse.ai → sidecar 抓到 session cookie 自动入池 →
 # 终端轮询 /api/token_status 拿到结果。全程不碰 API Key、不装 Python。
+# ── 直达链接 / 账号池读数（面板、--link、--add-account 共用）──────────
+#
+# 为什么要有「直达链接」：网页的接口地址和 Key 存在浏览器的 localStorage 里，
+# 按域名分开存 —— 换个入口打开（IP → 域名）就是一张白纸，用户得手抄一遍 Key，
+# 抄错了还只看到「Key 无效」。终端生成带 ?key=&api= 的链接，点开即自动配置，
+# 从根上消掉这一类问题。
+active_domain() {
+  local d="$DOMAIN"
+  if [ -z "$d" ] && [ -f "$INSTALL_DIR/Caddyfile" ]; then
+    # Caddyfile 形如：全局块 { ... } 然后 "域名 {"。取第一个站点块的名字。
+    d="$(awk '
+      /^[ \t]*\{[ \t]*$/ { blk=1; next }
+      blk && /^[ \t]*\}/ { blk=0; next }
+      blk { next }
+      /^[^ \t#]/ && /[ \t]*\{[ \t]*$/ { print $1; exit }
+    ' "$INSTALL_DIR/Caddyfile" 2>/dev/null)"
+  fi
+  printf '%s' "$d"
+}
+
+direct_link() {
+  local k="$1" dom
+  dom="$(active_domain)"
+  if [ -n "$dom" ]; then
+    printf 'https://%s/?key=%s&api=https://%s' "$dom" "$k" "$dom"
+  else
+    printf 'http://%s:%s/?key=%s&api=http://%s:%s' \
+      "$2" "$WEB_PORT" "$k" "$2" "$API_PORT"
+  fi
+}
+
+pool_summary() {
+  local k="$1" n
+  [ -n "$k" ] || return 0
+  n="$(curl -fsS --max-time 5 -H "Authorization: Bearer $k" \
+        "http://127.0.0.1:${API_PORT}/admin/accounts" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    acc = d.get("accounts") if isinstance(d, dict) else d
+    print(len(acc) if isinstance(acc, list) else "")
+except Exception:
+    print("")' 2>/dev/null)"
+  printf '%s' "$n"
+}
+
+# 生成一枚导号令牌：15 分钟窗口、imports 计数从 0 起。
+# 顺手清理过期令牌和旧版本留下的 used 标记条目。
+_new_import_token() {
+  local path="$1"
+  python3 - "$path" <<'PYTOK'
+import json, os, secrets, sys, tempfile, time
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        tokens = json.load(f)
+    if not isinstance(tokens, dict):
+        tokens = {}
+except Exception:
+    tokens = {}
+now = time.time()
+tokens = {t: m for t, m in tokens.items()
+          if isinstance(m, dict) and float(m.get("expires", 0) or 0) > now
+          and not m.get("used")}   # used 是 v1.4.x 的旧字段，留着没用
+tok = secrets.token_hex(16)
+tokens[tok] = {"created": now, "expires": now + 900, "imports": 0}
+directory = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tokens-")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(tokens, f)
+os.replace(tmp, path)
+print(tok)
+PYTOK
+}
+
 do_add_account() {
   load_state || need_state
   command -v docker >/dev/null 2>&1 || die "这台机器上没有 docker"
@@ -2882,93 +3095,407 @@ do_add_account() {
   fi
   command -v python3 >/dev/null 2>&1 || die "需要 python3（装的时候应该装过了，手动补一下：apt install -y python3）"
 
-  step "生成一次性导号链接"
+  step "生成导号链接"
   run mkdir -p "$INSTALL_DIR/runtime"
-  # 令牌文件：sidecar 每次请求现读，所以这里写完即刻生效。
-  # 同时顺手清理过期/已用的旧令牌，文件不会无限长大。
   local token
-  token="$(python3 - "$INSTALL_DIR/runtime/import_tokens.json" <<'PYTOK'
-import json, os, secrets, sys, tempfile, time
-path = sys.argv[1]
-try:
-    with open(path, encoding="utf-8") as f:
-        tokens = json.load(f)
-    if not isinstance(tokens, dict):
-        tokens = {}
-except Exception:
-    tokens = {}
-now = time.time()
-tokens = {t: m for t, m in tokens.items()
-          if isinstance(m, dict) and float(m.get("expires", 0)) > now and not m.get("used")}
-tok = secrets.token_hex(16)
-tokens[tok] = {"created": now, "expires": now + 900, "used": False}
-directory = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tokens-")
-with os.fdopen(fd, "w", encoding="utf-8") as f:
-    json.dump(tokens, f)
-os.replace(tmp, path)
-print(tok)
-PYTOK
-)" || die "令牌生成失败（python3 执行异常）"
+  # tr 兜底：即使 python 的 stdout 带了 CR（某些环境），令牌也不会被污染
+  token="$(_new_import_token "$INSTALL_DIR/runtime/import_tokens.json" | tr -d '\r\n')" \
+    || die "令牌生成失败（python3 执行异常）"
   [ -n "$token" ] || die "令牌生成失败（输出为空）"
   chmod 600 "$INSTALL_DIR/runtime/import_tokens.json" 2>/dev/null || true
 
-  local ip
+  local ip dom
   ip="$(public_ip 2>/dev/null)"
   [ -n "$ip" ] || ip="<本机公网IP>"
+  dom="$(active_domain)"
 
   say ""
   say "  ${C_BLD}在你自己电脑的浏览器里打开这个链接：${C_OFF}"
   say ""
-  say "      http://${ip}:${IMPORT_PORT}/?token=${token}"
-  if [ -n "$DOMAIN" ]; then
-    say ""
-    say "  ${C_DIM}（如果你给导号配过 nginx 反代 /import/ → ${IMPORT_PORT}，也可以走域名：${C_OFF}"
-    say "   ${C_DIM}https://${DOMAIN}/import/?token=${token} ）${C_OFF}"
+  if [ -n "$dom" ]; then
+    say "      https://${dom}/import/?token=${token}"
+    say "      ${C_DIM}（走域名的前提是域名反代里配过 /import/ → 127.0.0.1:${IMPORT_PORT}；"
+    say "       没配过就直接用下面这个直连地址）${C_OFF}"
   fi
+  say "      http://${ip}:${IMPORT_PORT}/?token=${token}"
   say ""
-  say "  ${C_DIM}· 链接 15 分钟内有效，成功导入一个账号后自动作废"
-  say "  · 打开后网页里会出现登录窗口，在里面登录 muse.ai 就行"
-  say "  · 这里会等结果，按 Ctrl-C 退出等待不影响链接本身${C_OFF}"
+  say "  ${C_DIM}· 打开后网页里会出现登录窗口，在里面登录 muse.ai 就行，导入全自动"
+  say "  · 一个链接 = 一个 15 分钟的导号窗口，可以连着导多个账号："
+  say "    导完一个在网页上点「再导一个」，换个 muse.ai 账号继续登录即可"
+  say "  · 这里会一直等并依次报出每个导入的账号；结束按 Ctrl-C，不影响已导入的${C_OFF}"
   say ""
 
-  # 轮询 sidecar 的状态端点（回环，不经过公网）
+  # 轮询 sidecar（回环，不经过公网）。since = 已经报过的导入次数，
+  # 每报一个 +1，于是同一个窗口里连导多个账号也能逐个拿到结果。
   local url="http://127.0.0.1:${IMPORT_PORT}/api/token_status?token=${token}"
-  local waited=0 state="" email="" resp=""
-  while [ "$waited" -lt 960 ]; do
-    resp="$(curl -fsS --max-time 5 "$url" 2>/dev/null)" || resp=""
+  local since=0 imported=0 waited=0 grace=0 legacy=0
+  local resp="" line="" state="" imp="" email="" cnt="" hasimp=""
+  while [ "$waited" -lt 1800 ]; do
+    resp="$(curl -fsS --max-time 5 "${url}&since=${since}" 2>/dev/null)" || resp=""
     if [ -n "$resp" ]; then
-      state="$(printf '%s' "$resp" | python3 -c 'import sys,json
+      line="$(printf '%s' "$resp" | python3 -c '
+import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d.get("state", ""), d.get("email", ""))
 except Exception:
-    print(" ", "")' 2>/dev/null)"
-      email="${state#* }"
-      state="${state%% *}"
+    d = {}
+# 最后一个字段：服务端认不认识 imports（v1.5.0+ 才有）
+print(d.get("state", ""), d.get("imports", -1), d.get("email", ""),
+      d.get("count", -1), 1 if "imports" in d else 0)' 2>/dev/null | tr -d '\r')"
+      state="$(printf '%s' "$line" | cut -d' ' -f1)"
+      imp="$(printf '%s' "$line" | cut -d' ' -f2)"
+      email="$(printf '%s' "$line" | cut -d' ' -f3)"
+      cnt="$(printf '%s' "$line" | cut -d' ' -f4)"
+      hasimp="$(printf '%s' "$line" | cut -d' ' -f5)"
       case "$state" in
         done)
-          printf '\r%-72s\r' " "
-          ok "导入成功：${email:-账号已进池}"
-          say ""
-          say "  想再加一个？直接再跑一次：sudo $(self_hint) --add-account"
-          say "  回网页生成第一条视频试试：http://${ip}:${WEB_PORT}/"
-          say ""
-          return 0 ;;
+          printf '\r%-72s\r' " " >&2
+          imported=$((imported + 1))
+          if [ "$hasimp" = "1" ] && [ "${imp:--1}" -ge 0 ] 2>/dev/null; then
+            since="$imp"
+          else
+            legacy=1
+          fi
+          if [ "${cnt:--1}" -ge 0 ] 2>/dev/null; then
+            ok "导入成功：${email:-账号已进池}（账号池现有 ${cnt} 个）"
+          else
+            ok "导入成功：${email:-账号已进池}"
+          fi
+          if [ "$legacy" = 1 ]; then
+            # 容器还是 v1.4.x 的导号服务：令牌用一次就废，连不了第二个。
+            warn "导号服务是旧版本（v1.4.x）—— 一条链接只能导一个账号。"
+            say "    想连着导多个：重跑一次安装升级即可"
+            say "      sudo $(self_hint) --upgrade"
+            break
+          fi
+          if [ "$imported" = 1 ]; then
+            say "    ${C_DIM}想再加一个？在刚才那个网页点「再导一个」，换个 muse.ai 账号登录 ——"
+            say "    这里会自动接着报；再等 90 秒没有新的就结束。${C_OFF}"
+          fi
+          grace=$((waited + 90))
+          ;;
         expired)
-          printf '\r%-72s\r' " "
-          err "链接过期了（15 分钟没人用）。重新生成一条："
+          printf '\r%-72s\r' " " >&2
+          if [ "$imported" = 0 ]; then
+            err "链接过期了（15 分钟没人用）。重新生成一条："
+            say "      sudo $(self_hint) --add-account"
+            return 1
+          fi
+          break ;;
+        unknown)
+          printf '\r%-72s\r' " " >&2
+          err "导号服务不认这条链接（容器可能刚重启过）。重新生成一条："
           say "      sudo $(self_hint) --add-account"
           return 1 ;;
       esac
     fi
-    printf '\r    等待浏览器里完成登录… %02d:%02d（Ctrl-C 退出等待）' "$((waited/60))" "$((waited%60))" >&2
+    if [ "$grace" -gt 0 ] && [ "$waited" -ge "$grace" ]; then
+      printf '\r%-72s\r' " " >&2
+      break
+    fi
+    if [ "$imported" = 0 ]; then
+      printf '\r    等待浏览器里完成登录… %02d:%02d（Ctrl-C 退出等待）' \
+        "$((waited / 60))" "$((waited % 60))" >&2
+    else
+      printf '\r    本次已导入 %d 个账号 · 还可以继续导，结束按 Ctrl-C' "$imported" >&2
+    fi
     sleep 3
     waited=$((waited + 3))
   done
-  printf '\r%-72s\r' " "
-  warn "等了 16 分钟还没完成，链接应该已经过期。重新生成：sudo $(self_hint) --add-account"
+  printf '\r%-72s\r' " " >&2
+
+  if [ "$imported" -gt 0 ]; then
+    say ""
+    say "  ${C_BLD}工作台直达链接${C_OFF}（接口地址和 Key 都已经带在里面，点开即用）："
+    say ""
+    say "      $(direct_link "$API_KEY" "$ip")"
+    say ""
+    say "  ${C_DIM}再管账号就敲：${C_OFF}sudo $(self_hint) --accounts"
+    say ""
+    return 0
+  fi
+
+  warn "等了 30 分钟还没完成，链接应该早就过期了。重新生成：sudo $(self_hint) --add-account"
   return 1
+}
+
+
+# ── 网页入口地址 ──────────────────────────────────────────────────────
+web_entry_url() {
+  local ip="$1" d
+  d="$(active_domain)"
+  if [ -n "$d" ]; then printf 'https://%s/' "$d"; else printf 'http://%s:%s/' "$ip" "$WEB_PORT"; fi
+}
+
+# ── 账号池管理 ────────────────────────────────────────────────────────
+_accounts_json() {
+  curl -fsS --max-time 10 -H "Authorization: Bearer $1" \
+    "http://127.0.0.1:${API_PORT}/admin/accounts" 2>/dev/null
+}
+
+# 账号列表渲染：编号 / 邮箱 / 状态 / 已用次数 / 有效期 / ID，重复邮箱单独标出
+_accounts_render() {
+  python3 -c '
+import sys, json, time, collections, datetime
+HINT = sys.argv[1] if len(sys.argv) > 1 else "bash install.sh"
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("  （解析不了账号池返回的数据）"); sys.exit(0)
+acc = d.get("accounts") if isinstance(d, dict) else d
+if not isinstance(acc, list) or not acc:
+    print("  账号池是空的 —— 还没导入 muse.ai 账号。")
+    print("")
+    print("  加账号：sudo %s --add-account" % HINT)
+    sys.exit(0)
+
+def when(ts):
+    try:
+        ts = float(ts)
+    except Exception:
+        return "-"
+    if ts <= 0:
+        return "-"
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+def dw(s):
+    """显示宽度：中日韩字符按 2 格算，中文列才不会歪。"""
+    return sum(2 if ord(c) > 0x2E80 else 1 for c in str(s))
+
+def pad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - dw(s))
+
+dup = collections.Counter()
+for a in acc:
+    dup[(a.get("label") or "").strip().lower()] += 1
+
+w = max([dw(a.get("label") or "") for a in acc] + [dw("邮箱 / 标签")])
+print("  账号池：%d 个账号" % len(acc))
+print("")
+print("   #   " + pad("邮箱 / 标签", w) + "  " + pad("状态", 6) + " "
+      + pad("已用", 4) + " " + pad("有效期至", 10) + "  ID")
+for i, a in enumerate(acc, 1):
+    label = a.get("label") or a.get("id") or ""
+    ok = a.get("ok")
+    st = "正常" if ok is True else ("异常" if ok is False else "未测")
+    if not a.get("enabled", True):
+        st = "已停用"
+    used = a.get("use_count")
+    used = "-" if used is None else str(used)
+    mark = "   <- 重复" if dup[(label or "").strip().lower()] > 1 else ""
+    print("   " + pad(i, 3) + " " + pad(label, w) + "  " + pad(st, 6) + " "
+          + pad(used, 4) + " " + pad(when(a.get("expires_at")), 10) + "  "
+          + str(a.get("id", "")) + mark)
+dups = [k for k, v in dup.items() if v > 1]
+if dups:
+    print("")
+    print("  ! 有 %d 个邮箱重复导入（同一个 muse.ai 账号进了多条）——" % len(dups))
+    print("    重复条目不会让额度变多，反而分不清哪条还能用。删掉多余的：")
+    print("      sudo %s --accounts --remove <上面的编号>" % HINT)
+print("")
+print("  删账号：  sudo %s --accounts --remove <编号>" % HINT)
+print("  测会话：  sudo %s --accounts --test   （真开浏览器，每个 10-30 秒）" % HINT)
+' "$1"
+}
+
+_accounts_list() {
+  local k="$1" json
+  json="$(_accounts_json "$k")"
+  if [ -z "$json" ]; then
+    die "拿不到账号池（接口没响应？先跑 sudo $(self_hint) --status 看看服务在不在）"
+  fi
+  say ""
+  printf '%s' "$json" | _accounts_render "$(self_hint)"
+}
+
+_accounts_remove() {
+  local k="$1" sel="$2" json aid
+  json="$(_accounts_json "$k")"
+  [ -n "$json" ] || die "拿不到账号池（接口没响应）"
+  aid="$(printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    acc = json.load(sys.stdin).get("accounts") or []
+except Exception:
+    acc = []
+sel = (sys.argv[1] or "").strip()
+if sel.isdigit():
+    i = int(sel)
+    if 1 <= i <= len(acc):
+        print(acc[i - 1].get("id", ""))
+else:
+    for a in acc:
+        if a.get("id") == sel:
+            print(sel); break
+' "$sel" 2>/dev/null)"
+  [ -n "$aid" ] || die "找不到编号/ID 是「$sel」的账号（先跑 sudo $(self_hint) --accounts 看列表）"
+
+  local label
+  label="$(printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    acc = json.load(sys.stdin).get("accounts") or []
+except Exception:
+    acc = []
+for a in acc:
+    if a.get("id") == sys.argv[1]:
+        print(a.get("label", "")); break
+' "$aid" 2>/dev/null)"
+
+  curl -fsS --max-time 10 -X DELETE -H "Authorization: Bearer $k" \
+    "http://127.0.0.1:${API_PORT}/admin/accounts/${aid}" >/dev/null 2>&1 \
+    || die "删除失败（接口报错，账号可能已经不在了）"
+  ok "已删除账号：${label:-$aid}"
+  say ""
+  _accounts_list "$k"
+}
+
+_accounts_test() {
+  local k="$1" json ids
+  json="$(_accounts_json "$k")"
+  [ -n "$json" ] || die "拿不到账号池（接口没响应）"
+  ids="$(printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    acc = json.load(sys.stdin).get("accounts") or []
+except Exception:
+    acc = []
+for a in acc:
+    print(a.get("id", "") + "\t" + (a.get("label") or ""))' 2>/dev/null)"
+  [ -n "$ids" ] || { warn "账号池是空的，没有可测的账号"; return 0; }
+
+  say ""
+  say "  逐个打开 muse.ai 验证会话（每个 10-30 秒，别急）..."
+  say ""
+  local id label res msg n=0 bad=0
+  while IFS="$(printf '\t')" read -r id label; do
+    [ -n "$id" ] || continue
+    n=$((n + 1))
+    printf '   [%d] %s … ' "$n" "$label" >&2
+    res="$(curl -fsS --max-time 180 -X POST -H "Authorization: Bearer $k" \
+      "http://127.0.0.1:${API_PORT}/admin/accounts/${id}/test" 2>/dev/null)"
+    msg="$(printf '%s' "$res" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print("ok" if d.get("ok") else "bad", d.get("message", ""))
+except Exception:
+    print("bad", "没拿到结果")' 2>/dev/null)"
+    if [ "${msg%% *}" = "ok" ]; then
+      printf '%s✓ 会话有效%s\n' "$C_GRN" "$C_OFF" >&2
+    else
+      bad=$((bad + 1))
+      printf '%s× %s%s\n' "$C_RED" "${msg#* }" "$C_OFF" >&2
+    fi
+  done <<EOF
+$ids
+EOF
+  say ""
+  if [ "$bad" -eq 0 ]; then
+    ok "全部 $n 个账号会话有效"
+  else
+    warn "$n 个账号里有 $bad 个有问题 —— 重新导一遍那个账号即可（--add-account）"
+  fi
+  say ""
+}
+
+do_accounts() {
+  load_state || need_state
+  local k="$API_KEY"
+  [ -n "$k" ] || die "读不到 API Key（安装记录里没有）。先跑 sudo $(self_hint) --status 看看"
+
+  if [ -n "$ACCT_REMOVE" ]; then _accounts_remove "$k" "$ACCT_REMOVE"; return $?; fi
+  if [ "$ACCT_TEST" = 1 ]; then   _accounts_test "$k";             return $?; fi
+  _accounts_list "$k"
+}
+
+# ── 直达链接 ──────────────────────────────────────────────────────────
+do_link() {
+  load_state || need_state
+  local ip
+  ip="$(public_ip 2>/dev/null)"
+  [ -n "$ip" ] || ip="<本机公网IP>"
+  say ""
+  say "  ${C_BLD}工作台直达链接${C_OFF}（接口地址和 Key 都带在里面，点开即用）"
+  say ""
+  say "      $(direct_link "$API_KEY" "$ip")"
+  say ""
+  say "  ${C_DIM}· 页面打开时自动填好接口地址和 API Key，不用手工配"
+  say "  · 手机 / 另一台电脑也能用，把链接发过去就行"
+  say "  · 当前 API Key：${API_KEY}${C_OFF}"
+  say ""
+}
+
+# ── 终端面板快捷命令：/usr/local/bin/muse ─────────────────────────────
+install_cli() {
+  local cli="/usr/local/bin/muse"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '    %s[dry-run]%s 写入 %s（之后敲 muse 就能进控制面板）\n' \
+      "$C_CYN" "$C_OFF" "$cli"
+    return 0
+  fi
+  cat > "$cli" <<EOF
+#!/usr/bin/env bash
+# $APP_LABEL 控制面板入口 —— 由 install.sh 生成，删掉它不影响程序运行。
+exec bash "$INSTALL_DIR/install.sh" "\$@"
+EOF
+  chmod 755 "$cli" 2>/dev/null || true
+}
+
+remove_cli() {
+  rm -f "/usr/local/bin/muse" 2>/dev/null || true
+}
+
+# ── 终端控制面板 ──────────────────────────────────────────────────────
+_menu_ask() {
+  local __v=""
+  if [ -r /dev/tty ]; then
+    IFS= read -r __v < /dev/tty || __v=""
+  else
+    IFS= read -r __v || __v=""
+  fi
+  printf '%s' "$__v"
+}
+
+interactive_menu() {
+  load_state || true
+  local ip n c
+  ip="$(public_ip 2>/dev/null)"
+  [ -n "$ip" ] || ip="<本机IP>"
+  while :; do
+    n="$(pool_summary "$API_KEY")"
+    say ""
+    say "  ${C_BLD}══════════════════════════════════════════════${C_OFF}"
+    say "   ${C_BLD}$APP_LABEL${C_OFF}  ·  控制面板"
+    say "  ${C_BLD}══════════════════════════════════════════════${C_OFF}"
+    say "    网页：   $(web_entry_url "$ip")"
+    say "    账号池： ${n:-?} 个 muse.ai 账号"
+    say ""
+    say "    1) 添加 muse.ai 账号（浏览器登录，可连着导多个）"
+    say "    2) 工作台直达链接（带 Key，点开即用）"
+    say "    3) 账号池管理（列出 / 删除 / 测活）"
+    say "    4) 运行状态"
+    say "    5) 升级到最新版"
+    say "    6) 重新配置并安装（沿用数据）"
+    say "    7) 卸载"
+    say "    0) 退出"
+    say ""
+    printf '  请选择 [0-7，回车=0]: ' >&2
+    c="$(_menu_ask)"
+    c="${c:-0}"
+    case "$c" in
+      1) do_add_account ;;
+      2) do_link ;;
+      3) do_accounts ;;
+      4) do_status ;;
+      5) do_upgrade ;;
+      6) do_install ;;
+      7) do_uninstall; return $? ;;
+      0|q|exit) say ""; say "  收工。下次敲 muse 就能回来。"; say ""; return 0 ;;
+      *) say "  ${C_YEL}没看懂「$c」—— 请输入 0 到 7 之间的数字${C_OFF}" ;;
+    esac
+  done
 }
 
 # ── --uninstall ──────────────────────────────────────────────────────
@@ -3009,6 +3536,9 @@ do_uninstall() {
   run systemctl disable --now "${WEB_UNIT}" 2>/dev/null || true
   run rm -f "/etc/systemd/system/${WEB_UNIT}"
   run systemctl daemon-reload
+
+  # 顺手把终端面板快捷命令摘掉（否则 muse 会指向一个不存在的脚本）
+  remove_cli
 
   local del_dir=n
   # 非交互时**默认保留**数据（del_dir=n），只删服务不删账号 —— 这是保守的安全默认。
@@ -3128,6 +3658,8 @@ main() {
 
   if [ "$DO_STATUS" = 1 ]; then     do_status; exit $?; fi
   if [ "$DO_ADD_ACCOUNT" = 1 ]; then check_root "$@"; do_add_account; exit $?; fi
+  if [ "$DO_ACCOUNTS" = 1 ]; then   check_root "$@"; do_accounts; exit $?; fi
+  if [ "$DO_LINK" = 1 ]; then       do_link; exit $?; fi
   if [ "$DO_UNINSTALL" = 1 ]; then  check_root "$@"; do_uninstall; exit $?; fi
   if [ "$DO_UPGRADE" = 1 ]; then    check_root "$@"; do_upgrade; exit $?; fi
 
@@ -3138,27 +3670,11 @@ main() {
     load_state || true
   fi
 
-  # 已装过 → 让用户选
+  # 已装过 + 有终端 → 直接进控制面板（加账号 / 管账号池 / 拿直达链接都在这儿）。
+  # --yes 或非交互（脚本、管道）时保持老行为：直接幂等重装一遍。
   if [ -f "$INSTALL_DIR/install.conf" ] && [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
-    say ""
-    say "  检测到这台机器上已经装过 $APP_LABEL。"
-    say "    1) 重新配置并安装（会沿用现有数据）"
-    say "    2) 升级到最新版"
-    say "    3) 卸载"
-    say "    4) 退出"
-    local m=""
-    while :; do
-      printf '  请选择 [1-4，回车=1]: ' >&2
-      read -r m || m=""
-      m="${m:-1}"
-      case "$m" in
-        1) break ;;
-        2) do_upgrade; exit $? ;;
-        3) do_uninstall; exit $? ;;
-        4) exit 0 ;;
-        *) printf '  %s没看懂「%s」—— 请输入 1 到 4 之间的数字%s\n' "$C_YEL" "$m" "$C_OFF" >&2 ;;
-      esac
-    done
+    interactive_menu
+    return $?
   fi
 
   do_install
